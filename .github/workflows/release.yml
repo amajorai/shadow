@@ -1,0 +1,39 @@
+name: release
+
+# Builds the shadow binary (Windows-first) and attaches it to a GitHub Release on a v* tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/shadow
+      - name: Build
+        run: cargo build --release --manifest-path apps/shadow/Cargo.toml
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "apps/shadow/target/release/shadow.exe" "dist/shadow-Windows-x64.exe"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
