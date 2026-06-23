@@ -32,7 +32,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libx11-dev libxi-dev libxtst-dev libxrandr-dev             libxss-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-xfixes0-dev             libxdo-dev libdbus-1-dev libssl-dev
+          sudo apt-get install -y pkg-config libx11-dev libxi-dev libxtst-dev libxrandr-dev             libxss-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-xfixes0-dev             libxdo-dev libdbus-1-dev libssl-dev libasound2-dev libpulse-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
