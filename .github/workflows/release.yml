@@ -1,6 +1,6 @@
 name: release
 
-# Builds the shadow binary (Windows-first) and attaches it to a GitHub Release on a v* tag.
+# Builds the shadow binary for Linux/macOS/Windows and attaches them to a GitHub Release on a v* tag.
 on:
   push:
     tags: ["v*"]
@@ -15,11 +15,24 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: ${{ matrix.osname }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  osname: Linux,   ext: "" }
+          - { os: macos-latest,   osname: macOS,   ext: "" }
+          - { os: windows-latest, osname: Windows, ext: ".exe" }
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Linux deps (X11 / input / capture)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxi-dev libxtst-dev libxrandr-dev             libxss-dev libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxcb-xfixes0-dev             libxdo-dev libdbus-1-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -30,7 +43,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "apps/shadow/target/release/shadow.exe" "dist/shadow-Windows-x64.exe"
+          cp "apps/shadow/target/release/shadow${{ matrix.ext }}" "dist/shadow-${{ matrix.osname }}-x64${{ matrix.ext }}"
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
