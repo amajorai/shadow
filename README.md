@@ -1,6 +1,6 @@
 # Shadow
 
-> Your computer was paying attention the whole time — screen/audio/input capture, OCR, and
+> Your computer was paying attention the whole time: screen/audio/input capture, OCR, and
 > semantic search, all on-device.
 
 [![License](https://shieldcn.dev/badge/License-Apache--2.0-73DC8C.svg?logo=apache&logoColor=white)](./LICENSE)
@@ -10,12 +10,12 @@ Shadow is a Rust capture-and-intelligence sidecar (~23k LOC): screen/audio/input
 proactive engine, and semantic memory + search. It records pure-Rust JPEG keyframes (no ffmpeg
 required). A component of [Ryu](https://github.com/amajorai/ryu), it runs standalone on `:3030`.
 
-- 📸 **Capture** — screen, audio, and input, with OCR over every frame.
-- 🎞️ **Zero-setup keyframes** — pure-Rust JPEG keyframes at the changed frames; no ffmpeg required.
-- 🔎 **Semantic memory** — everything captured is embedded and searchable on-device.
-- 💡 **Proactive engine** — surfaces context and suggestions from what it sees.
-- 🏠 **On-device by design** — a device-bound sensor: capture never leaves the machine.
-- 🔓 **Open, consent-gated, pausable** — sensitive by nature, so it's auditable and gated behind explicit consent.
+- 📸 **Capture.** Screen, audio, and input, with OCR over every frame.
+- 🎞️ **Zero-setup keyframes.** Pure-Rust JPEG keyframes at the changed frames; no ffmpeg required.
+- 🔎 **Semantic memory.** Everything captured is embedded and searchable on-device.
+- 💡 **Proactive engine.** Surfaces context and suggestions from what it sees.
+- 🏠 **On-device by design.** A device-bound sensor: capture never leaves the machine.
+- 🔓 **Open, consent-gated, pausable.** Sensitive by nature, so it's auditable and gated behind explicit consent.
 
 ## Layout
 
@@ -39,6 +39,6 @@ control. It's open-source so this is fully auditable. See [SECURITY](./apps/shad
 
 ## Credits & license
 
-Shadow is derived from [Shadow](https://github.com/ghostwright/shadow) by Ghostwright (MIT) — the
+Shadow is derived from [Shadow](https://github.com/ghostwright/shadow) by Ghostwright (MIT). The
 original copyright + license notice are retained in [NOTICE](./NOTICE). Licensed under **Apache-2.0**
 (see [LICENSE](./LICENSE)) with MIT-licensed portions per NOTICE. © 2026 A Major Pte. Ltd.
