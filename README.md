@@ -10,6 +10,13 @@ Shadow is a Rust capture-and-intelligence sidecar (~23k LOC): screen/audio/input
 proactive engine, and semantic memory + search. It records pure-Rust JPEG keyframes (no ffmpeg
 required). A component of [Ryu](https://github.com/amajorai/ryu), it runs standalone on `:3030`.
 
+- 📸 **Capture** — screen, audio, and input, with OCR over every frame.
+- 🎞️ **Zero-setup keyframes** — pure-Rust JPEG keyframes at the changed frames; no ffmpeg required.
+- 🔎 **Semantic memory** — everything captured is embedded and searchable on-device.
+- 💡 **Proactive engine** — surfaces context and suggestions from what it sees.
+- 🏠 **On-device by design** — a device-bound sensor: capture never leaves the machine.
+- 🔓 **Open, consent-gated, pausable** — sensitive by nature, so it's auditable and gated behind explicit consent.
+
 ## Layout
 
 | Path | What |
