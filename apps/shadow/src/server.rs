@@ -326,12 +326,15 @@ struct MeetingStartRequest {
 }
 
 async fn meeting_start_handler(Json(req): Json<MeetingStartRequest>) -> impl IntoResponse {
-    let ingest_url = req.ingest_url.unwrap_or_else(|| {
-        format!(
-            "http://127.0.0.1:7980/api/meetings/{}/chunk",
-            req.meeting_id
-        )
-    });
+    let ingest_url = match resolve_meeting_ingest_url(&req) {
+        Ok(url) => url,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "recording": false, "error": message })),
+            )
+        }
+    };
     match crate::capture::meeting::start(req.meeting_id.clone(), ingest_url) {
         Ok(()) => (
             StatusCode::OK,
@@ -342,6 +345,32 @@ async fn meeting_start_handler(Json(req): Json<MeetingStartRequest>) -> impl Int
             Json(json!({ "recording": false, "error": e.to_string() })),
         ),
     }
+}
+
+fn resolve_meeting_ingest_url(req: &MeetingStartRequest) -> Result<String, String> {
+    let fallback = format!(
+        "http://127.0.0.1:7980/api/meetings/{}/chunk",
+        req.meeting_id
+    );
+    let Some(raw) = req.ingest_url.as_deref() else {
+        return Ok(fallback);
+    };
+    let parsed = reqwest::Url::parse(raw).map_err(|_| "invalid ingest_url".to_string())?;
+    if parsed.scheme() != "http" {
+        return Err("ingest_url must use http".to_string());
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return Err("ingest_url must point to loopback Core".to_string());
+    }
+    if parsed.port_or_known_default() != Some(7980) {
+        return Err("ingest_url must use Core's loopback port".to_string());
+    }
+    let expected_path = format!("/api/meetings/{}/chunk", req.meeting_id);
+    if parsed.path() != expected_path {
+        return Err("ingest_url path does not match the meeting".to_string());
+    }
+    Ok(raw.to_string())
 }
 
 /// POST /meeting/stop — stop the current recording (body is ignored).
@@ -1009,6 +1038,52 @@ mod tests {
             summary_queue: None,
             window_tracker: None,
             ax_tree: None,
+        }
+    }
+
+    #[test]
+    fn meeting_ingest_url_defaults_to_loopback_core() {
+        let req = MeetingStartRequest {
+            meeting_id: "meeting-1".to_string(),
+            ingest_url: None,
+        };
+
+        let url = resolve_meeting_ingest_url(&req).expect("default ingest url");
+
+        assert_eq!(url, "http://127.0.0.1:7980/api/meetings/meeting-1/chunk");
+    }
+
+    #[test]
+    fn meeting_ingest_url_accepts_matching_loopback_url() {
+        let req = MeetingStartRequest {
+            meeting_id: "meeting-1".to_string(),
+            ingest_url: Some("http://localhost:7980/api/meetings/meeting-1/chunk".to_string()),
+        };
+
+        let url = resolve_meeting_ingest_url(&req).expect("explicit ingest url");
+
+        assert_eq!(url, "http://localhost:7980/api/meetings/meeting-1/chunk");
+    }
+
+    #[test]
+    fn meeting_ingest_url_rejects_remote_or_mismatched_targets() {
+        let cases = [
+            "https://localhost:7980/api/meetings/meeting-1/chunk",
+            "http://example.com:7980/api/meetings/meeting-1/chunk",
+            "http://127.0.0.1:7981/api/meetings/meeting-1/chunk",
+            "http://127.0.0.1:7980/api/meetings/other/chunk",
+        ];
+
+        for ingest_url in cases {
+            let req = MeetingStartRequest {
+                meeting_id: "meeting-1".to_string(),
+                ingest_url: Some(ingest_url.to_string()),
+            };
+
+            assert!(
+                resolve_meeting_ingest_url(&req).is_err(),
+                "{ingest_url} should be rejected"
+            );
         }
     }
 

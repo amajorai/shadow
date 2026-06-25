@@ -8,7 +8,7 @@ name = "shadow"
 path = "src/main.rs"
 
 [dependencies]
-shadow-core = { path = "../../crates/shadow-core" }
+shadow-core = { path = "../../crates/shadow-core", package = "ryu-shadow-core" }
 ghost-core = { path = "../../crates/ghost-core" }
 ghost-eyes = { path = "../../crates/ghost-eyes" }
 ghost-hands = { path = "../../crates/ghost-hands" }

@@ -3778,6 +3778,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-shadow-core"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "env_logger",
+ "libc",
+ "log",
+ "rmp-serde",
+ "rmpv",
+ "rusqlite",
+ "serde",
+ "serde_bytes",
+ "tantivy",
+ "thiserror 2.0.18",
+ "zstd",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3970,10 +3988,10 @@ dependencies = [
  "rmp-serde",
  "rmpv",
  "rusqlite",
+ "ryu-shadow-core",
  "serde",
  "serde_json",
  "sha2",
- "shadow-core",
  "tesseract",
  "tokio",
  "tokio-stream",
@@ -3985,24 +4003,6 @@ dependencies = [
  "windows 0.59.0",
  "winreg",
  "x11rb",
-]
-
-[[package]]
-name = "shadow-core"
-version = "0.0.1"
-dependencies = [
- "chrono",
- "env_logger",
- "libc",
- "log",
- "rmp-serde",
- "rmpv",
- "rusqlite",
- "serde",
- "serde_bytes",
- "tantivy",
- "thiserror 2.0.18",
- "zstd",
 ]
 
 [[package]]
