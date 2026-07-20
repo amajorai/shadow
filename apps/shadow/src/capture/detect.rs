@@ -11,9 +11,14 @@
 //! - **Windows** (primary): the `CapabilityAccessManager\ConsentStore\microphone`
 //!   registry records every app's mic usage; an app is using the mic *right now*
 //!   when its `LastUsedTimeStop == 0`.
-//! - **macOS / Linux**: not yet implemented (macOS would poll CoreAudio's
-//!   `kAudioDevicePropertyDeviceIsRunningSomewhere`). Returns `None` so the rest of
-//!   the pipeline is inert there — Windows-first, like the rest of Shadow.
+//! - **Linux** (PulseAudio/PipeWire): `pactl list source-outputs` lists every
+//!   process *currently recording*; we report the owning application's name. This
+//!   is an accurate per-process signal, like Windows.
+//! - **macOS**: there is no public per-process "is the mic in use" API. As a
+//!   heuristic we scan running processes for a known meeting app (`ps`), which is
+//!   coarser — it fires when a meeting app is running, and Core's app-list filter +
+//!   debounce keep it from being noisy. A native CoreAudio/TCC signal is the
+//!   eventual upgrade.
 
 /// A process currently holding the microphone.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +89,85 @@ fn friendly_process_name(key_name: &str) -> String {
         .to_string()
 }
 
-#[cfg(not(windows))]
+/// Linux: ask PulseAudio/PipeWire which processes are recording right now via
+/// `pactl list source-outputs`, and return the owning application's name. A
+/// source-output whose source is a monitor is playback, not a mic — we skip those.
+#[cfg(target_os = "linux")]
+pub fn microphone_in_use() -> Option<MicUser> {
+    let output = std::process::Command::new("pactl")
+        .args(["list", "source-outputs"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Each "Source Output #N" block has an `application.name = "…"` property and a
+    // `Source:` line. A real mic capture reads a non-monitor source.
+    let mut app: Option<String> = None;
+    let mut on_monitor = false;
+    for block in text.split("Source Output #") {
+        app = None;
+        on_monitor = false;
+        for line in block.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("application.name = ") {
+                app = Some(rest.trim_matches('"').to_string());
+            } else if trimmed.starts_with("Source:") && trimmed.to_lowercase().contains("monitor") {
+                on_monitor = true;
+            }
+        }
+        if !on_monitor {
+            if let Some(name) = app.clone() {
+                if !name.is_empty() {
+                    return Some(MicUser { process: name });
+                }
+            }
+        }
+    }
+    let _ = on_monitor;
+    None
+}
+
+/// A small built-in list of meeting-app process names used only to *gate* the
+/// macOS heuristic below. Core still authoritatively filters detections against
+/// its (user-editable) meeting-app list; this just avoids reporting every process.
+#[cfg(target_os = "macos")]
+const MAC_MEETING_PROCS: &[&str] = &[
+    "zoom.us", "zoom", "Microsoft Teams", "Teams", "Webex", "Google Chrome Helper",
+    "Slack", "Discord", "FaceTime", "Skype", "GoToMeeting", "Around", "Whereby",
+];
+
+/// macOS: no public per-process mic API, so scan running processes for a known
+/// meeting app. Coarser than the Windows/Linux paths (it reports when a meeting
+/// app is *running*, not strictly while the mic is live).
+#[cfg(target_os = "macos")]
+pub fn microphone_in_use() -> Option<MicUser> {
+    let output = std::process::Command::new("ps")
+        .args(["-Ao", "comm="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let name = line.trim();
+        let lower = name.to_lowercase();
+        for proc in MAC_MEETING_PROCS {
+            if lower.contains(&proc.to_lowercase()) {
+                // Report the last path segment (the binary name).
+                let short = name.rsplit('/').next().unwrap_or(name);
+                return Some(MicUser {
+                    process: short.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn microphone_in_use() -> Option<MicUser> {
     None
 }

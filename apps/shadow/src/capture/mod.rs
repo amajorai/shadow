@@ -1,8 +1,12 @@
 pub mod accessibility;
 pub mod audio;
+pub mod clip;
 pub mod detect;
+pub mod frames;
 pub mod input;
 pub mod meeting;
+pub mod mixer;
+pub mod segmenter;
 pub mod passive;
 pub mod screen;
 pub mod window;

@@ -146,6 +146,8 @@ struct CaptureControlRequest {
     /// When false, stop saving screen-frame keyframes (timeline thumbnails) while
     /// leaving the rest of capture running. Omit to leave unchanged.
     frames: Option<bool>,
+    /// Total days to keep captured Shadow history. Values are clamped by shadow-core.
+    history_retention_days: Option<u32>,
 }
 
 /// GET /capture/control response.
@@ -155,6 +157,8 @@ struct CaptureControlResponse {
     app_allowlist: Vec<String>,
     /// Whether screen-frame keyframe capture is currently enabled.
     frames: bool,
+    /// Total days Shadow keeps captured Timeline/search history.
+    history_retention_days: u32,
 }
 
 #[derive(Serialize)]
@@ -177,11 +181,35 @@ struct TimelineQuery {
 }
 
 #[derive(Deserialize)]
+struct JournalQuery {
+    start: u64,
+    end: u64,
+    /// When true, run the optional LLM narration pass over the derived cards.
+    #[serde(default)]
+    narrate: bool,
+}
+
+#[derive(Deserialize)]
+struct WeeklyQuery {
+    /// End of the review window in Unix micros (typically "now").
+    end: u64,
+    /// Number of trailing calendar days to include (defaults to 7).
+    #[serde(default)]
+    days: Option<u32>,
+}
+
+#[derive(Deserialize)]
 struct FrameQuery {
     /// Target moment in Unix microseconds; the nearest keyframe is returned.
     ts: u64,
     /// Display to pull the frame from. Defaults to 0 when omitted.
     display: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct RecentActivityQuery {
+    /// Trailing window in minutes; clamped to 1..=15. Defaults to 3 when omitted.
+    minutes: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -243,7 +271,10 @@ fn build_router(state: AppState) -> Router {
         .route("/search/semantic", get(semantic_search_handler))
         // Timeline
         .route("/timeline", get(timeline_handler))
+        .route("/journal", get(journal_handler))
+        .route("/journal/weekly", get(journal_weekly_handler))
         .route("/frame", get(frame_handler))
+        .route("/activity/recent", get(recent_activity_handler))
         .route("/context/recent", get(recent_context_handler))
         .route("/context/current", get(current_context_handler))
         // Agent
@@ -285,6 +316,18 @@ fn build_router(state: AppState) -> Router {
         .route("/meeting/start", post(meeting_start_handler))
         .route("/meeting/stop", post(meeting_stop_handler))
         .route("/meeting/status", get(meeting_status_handler))
+        // Clips (agent-native Loom/Jam: screen+audio bundle → Core)
+        .route("/clips/start", post(clips_start_handler))
+        .route("/clips/ingest", post(clips_ingest_handler))
+        .route("/clips/sources", get(clips_sources_handler))
+        .route("/clips", get(clips_list_handler))
+        .route("/clips/{id}/stop", post(clips_stop_handler))
+        .route("/clips/{id}/pause", post(clips_pause_handler))
+        .route("/clips/{id}/resume", post(clips_resume_handler))
+        .route("/clips/{id}/context", get(clips_context_handler))
+        .route("/clips/{id}/frame", get(clips_frame_handler))
+        .route("/clips/{id}/diagnostics", post(clips_diagnostics_handler))
+        .route("/clips/{id}/file", get(clips_file_handler))
         .layer(cors)
         .with_state(state)
 }
@@ -387,6 +430,212 @@ async fn meeting_status_handler() -> impl IntoResponse {
     }))
 }
 
+// ─── Clips ──────────────────────────────────────────────────────────────────────
+//
+// Agent-native Loom/Jam: Core drives one-click screen+audio recording through
+// these endpoints, then serves the resulting bundle (video / manifest / frames)
+// back to the desktop. Shadow owns the sensor half (capture + mux + bundle); see
+// `capture::clip`. Handlers are State-less — the recorder is a process-global.
+
+/// POST /clips/start — begin a clip with the given capture sources.
+async fn clips_start_handler(
+    Json(opts): Json<crate::capture::clip::ClipStartOpts>,
+) -> impl IntoResponse {
+    match crate::capture::clip::start(opts) {
+        Ok(ctx) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(ctx).unwrap_or_else(|_| json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// POST /clips/ingest — ingest a URL/local video (already resolved to a local
+/// path + optional captions by Core) into the same agent-context bundle a
+/// recorded clip produces. Shells ffmpeg + a possible transcription round-trip,
+/// so it runs on the blocking pool (like `clips_stop_handler`).
+async fn clips_ingest_handler(
+    Json(opts): Json<crate::capture::clip::ClipIngestOpts>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || crate::capture::clip::ingest(opts)).await;
+    match result {
+        Ok(Ok(ctx)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(ctx).unwrap_or_else(|_| json!({}))),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("ingest task failed: {e}") })),
+        ),
+    }
+}
+
+/// GET /clips — list all clips, newest first.
+async fn clips_list_handler() -> impl IntoResponse {
+    match crate::capture::clip::list() {
+        Ok(clips) => (StatusCode::OK, Json(json!({ "clips": clips }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// POST /clips/{id}/stop — finalize the current clip (ffmpeg mux + transcript).
+///
+/// `stop` blocks on ffmpeg + a network round-trip, so it runs on the blocking
+/// pool. The `id` path param identifies the clip for the client; the recorder is
+/// a singleton so only the in-progress clip is stopped.
+async fn clips_stop_handler(Path(_id): Path<String>) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(crate::capture::clip::stop).await;
+    match result {
+        Ok(Ok(Some(ctx))) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(ctx).unwrap_or_else(|_| json!({}))),
+        ),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no clip is recording" })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("stop task failed: {e}") })),
+        ),
+    }
+}
+
+/// POST /clips/{id}/pause — pause the in-progress clip (excludes the paused span
+/// from the clip duration and suspends capture). The recorder is a singleton, so
+/// `id` identifies the clip for the client only.
+async fn clips_pause_handler(Path(_id): Path<String>) -> impl IntoResponse {
+    match crate::capture::clip::pause() {
+        Some(id) => {
+            let duration_ms = crate::capture::clip::live_duration_ms().unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(json!({ "paused": true, "id": id, "durationMs": duration_ms })),
+            )
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no clip is recording" })),
+        ),
+    }
+}
+
+/// POST /clips/{id}/resume — resume a paused clip.
+async fn clips_resume_handler(Path(_id): Path<String>) -> impl IntoResponse {
+    match crate::capture::clip::resume() {
+        Some(id) => {
+            let duration_ms = crate::capture::clip::live_duration_ms().unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(json!({ "paused": false, "id": id, "durationMs": duration_ms })),
+            )
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no clip is recording" })),
+        ),
+    }
+}
+
+/// GET /clips/sources — the displays and windows a clip can capture from.
+async fn clips_sources_handler() -> impl IntoResponse {
+    let displays: Vec<serde_json::Value> = crate::capture::screen::enumerate_displays()
+        .into_iter()
+        .map(|d| {
+            let label = if d.is_primary {
+                format!("Display {} (primary)", d.id + 1)
+            } else {
+                format!("Display {}", d.id + 1)
+            };
+            json!({ "id": d.id, "label": label, "primary": d.is_primary })
+        })
+        .collect();
+    let windows: Vec<serde_json::Value> = crate::capture::screen::enumerate_windows()
+        .into_iter()
+        .map(|(id, title)| json!({ "id": id, "title": title }))
+        .collect();
+    Json(json!({ "displays": displays, "windows": windows }))
+}
+
+/// GET /clips/{id}/context — the clip manifest (agent-context.json).
+async fn clips_context_handler(Path(id): Path<String>) -> impl IntoResponse {
+    match crate::capture::clip::read_context(&id) {
+        Ok(ctx) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(ctx).unwrap_or_else(|_| json!({}))),
+        ),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "clip not found" })),
+        ),
+    }
+}
+
+/// Query for GET /clips/{id}/frame.
+#[derive(Deserialize)]
+struct ClipFrameQuery {
+    #[serde(rename = "atMs", default)]
+    at_ms: u64,
+}
+
+/// GET /clips/{id}/frame?atMs= — a single JPEG frame at the requested moment.
+async fn clips_frame_handler(Path(id): Path<String>, Query(q): Query<ClipFrameQuery>) -> Response {
+    let at_ms = q.at_ms;
+    let path = tokio::task::spawn_blocking(move || crate::capture::clip::extract_frame(&id, at_ms))
+        .await;
+    let path = match path {
+        Ok(Ok(p)) => p,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// POST /clips/{id}/diagnostics — append console/network diagnostics.
+#[derive(Deserialize)]
+struct DiagnosticsBody {
+    #[serde(default)]
+    events: Vec<crate::capture::clip::DiagnosticEvent>,
+}
+
+async fn clips_diagnostics_handler(
+    Path(id): Path<String>,
+    Json(body): Json<DiagnosticsBody>,
+) -> impl IntoResponse {
+    match crate::capture::clip::append_diagnostics(&id, body.events) {
+        Ok(ingested) => (StatusCode::OK, Json(json!({ "ingested": ingested }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// GET /clips/{id}/file — the muxed clip.mp4 bytes.
+async fn clips_file_handler(Path(id): Path<String>) -> Response {
+    let path = crate::capture::clip::clip_file_path(&id);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "video/mp4")], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 // ─── Search ────────────────────────────────────────────────────────────────────
 
 async fn search_handler(Query(query): Query<SearchQuery>) -> impl IntoResponse {
@@ -423,6 +672,79 @@ async fn timeline_handler(Query(query): Query<TimelineQuery>) -> impl IntoRespon
     }
 }
 
+async fn journal_handler(
+    State(state): State<AppState>,
+    Query(query): Query<JournalQuery>,
+) -> impl IntoResponse {
+    match shadow_core::query_journal_snapshot(query.start, query.end) {
+        Ok(mut snapshot) => {
+            if query.narrate {
+                if let Some(orchestrator) = &state.orchestrator {
+                    snapshot.cards = crate::intelligence::journal_narrator::narrate_cards(
+                        orchestrator,
+                        snapshot.cards.clone(),
+                    )
+                    .await;
+                    // Card ranges/categories are preserved by the narrator; only
+                    // the standup text needs refreshing to use narrated titles.
+                    shadow_core::journal::rebuild_derived(&mut snapshot);
+                }
+            }
+            Json(json!({ "journal": snapshot }))
+        }
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// Fold the trailing N calendar days into one weekly retrospective. Each day is
+/// a separate `query_journal_snapshot` over its local-midnight window; the pure
+/// `build_weekly_review` aggregates focus, category/app allocation, and daily
+/// rollups. Narration is intentionally NOT run here (too many cards for one
+/// pass) — the weekly view uses deterministic card text.
+async fn journal_weekly_handler(Query(query): Query<WeeklyQuery>) -> impl IntoResponse {
+    use chrono::{DateTime, Duration, Local, TimeZone, Utc};
+
+    const MICROS_PER_SEC: i64 = 1_000_000;
+    let day_count = query.days.unwrap_or(7).clamp(1, 31) as i64;
+
+    // Anchor on the local calendar day containing `end`.
+    let end_secs = (query.end / 1_000_000) as i64;
+    let end_dt: DateTime<Local> = Local
+        .timestamp_opt(end_secs, 0)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(end_secs, 0).single().unwrap().into());
+    let anchor_date = end_dt.date_naive();
+
+    let mut days: Vec<(String, shadow_core::journal::JournalSnapshot)> = Vec::new();
+    // Walk oldest → newest so rollups render left-to-right.
+    for offset in (0..day_count).rev() {
+        let date = anchor_date - Duration::days(offset);
+        let Some(day_start) = date
+            .and_hms_opt(0, 0, 0)
+            .and_then(|naive| Local.from_local_datetime(&naive).single())
+        else {
+            continue;
+        };
+        let start_us = (day_start.timestamp() * MICROS_PER_SEC).max(0) as u64;
+        let end_us = ((day_start.timestamp() + 86_400) * MICROS_PER_SEC).max(0) as u64;
+        // Never look past the requested end.
+        let end_us = end_us.min(query.end);
+        if end_us <= start_us {
+            continue;
+        }
+        match shadow_core::query_journal_snapshot(start_us, end_us) {
+            Ok(snapshot) => days.push((date.format("%Y-%m-%d").to_string(), snapshot)),
+            Err(e) => {
+                return Json(json!({ "error": e.to_string() }));
+            }
+        }
+    }
+
+    let window_start = days.first().map(|(_, s)| s.start_ts).unwrap_or(query.end);
+    let review = shadow_core::journal::build_weekly_review(window_start, query.end, &days);
+    Json(json!({ "review": review }))
+}
+
 /// GET /frame?ts=<micros>&display=<id> — the nearest recorded keyframe JPEG.
 ///
 /// Returns the closest keyframe to `ts` for `display` (default 0), letting the
@@ -447,6 +769,120 @@ async fn frame_handler(Query(query): Query<FrameQuery>) -> Response {
             StatusCode::NOT_FOUND.into_response()
         }
     }
+}
+
+/// GET /activity/recent?minutes=<n> — an EPHEMERAL bundle of the last N minutes
+/// of screen keyframes for chat "attach recent activity". Persists NOTHING.
+///
+/// Gathers keyframes in [now-n_min, now] across all displays, even-subsamples to
+/// at most 30, reads each JPEG from disk, and returns base64 data URLs plus a
+/// short markdown summary + transcript derived from the timeline. Keyframes
+/// (~every 10s) are the source, so this does NOT depend on MP4 segments existing.
+/// `minutes` is clamped to 1..=15.
+async fn recent_activity_handler(
+    Query(query): Query<RecentActivityQuery>,
+) -> Json<serde_json::Value> {
+    use base64::Engine;
+
+    let minutes = query.minutes.unwrap_or(3).clamp(1, 15);
+    let now = wall_micros();
+    let start = now.saturating_sub(minutes as u64 * 60 * 1_000_000);
+
+    // Keyframes across all displays, ordered oldest→newest.
+    let kfs = match shadow_core::keyframes_between(None, start, now) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("recent_activity keyframes_between failed: {e}");
+            Vec::new()
+        }
+    };
+
+    // Even-subsample to at most 30 frames.
+    const MAX_FRAMES: usize = 30;
+    let picked: Vec<_> = if kfs.len() <= MAX_FRAMES {
+        kfs
+    } else {
+        let step = kfs.len() as f64 / MAX_FRAMES as f64;
+        (0..MAX_FRAMES)
+            .map(|i| kfs[((i as f64) * step) as usize].clone())
+            .collect()
+    };
+
+    // Read + base64-encode each JPEG. Skip unreadable frames (fail-soft).
+    let mut frames = Vec::with_capacity(picked.len());
+    for kf in &picked {
+        match tokio::fs::read(&kf.file_path).await {
+            Ok(bytes) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let at_ms = kf.ts.saturating_sub(start) / 1_000;
+                frames.push(json!({
+                    "atMs": at_ms,
+                    "dataUrl": format!("data:image/jpeg;base64,{b64}"),
+                }));
+            }
+            Err(e) => {
+                tracing::debug!("recent_activity frame read failed for {}: {e}", kf.file_path);
+            }
+        }
+    }
+
+    // Short markdown summary + transcript from the timeline OCR/events.
+    let (summary, transcript) = match shadow_core::query_time_range(start, now) {
+        Ok(entries) => build_activity_text(minutes, &entries),
+        Err(_) => (format!("Recent activity (last {minutes} min)"), String::new()),
+    };
+
+    Json(json!({
+        "title": format!("Recent activity (last {minutes} min)"),
+        "durationMs": minutes as u64 * 60_000,
+        "summary": summary,
+        "transcript": transcript,
+        "frames": frames,
+    }))
+}
+
+/// Derive a short markdown summary + line-per-focus transcript from timeline
+/// entries. Uses app_name / window_title from `TimelineEntry`.
+fn build_activity_text(
+    minutes: u32,
+    entries: &[shadow_core::timeline::TimelineEntry],
+) -> (String, String) {
+    use std::collections::BTreeSet;
+
+    let mut apps: BTreeSet<String> = BTreeSet::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut last: Option<(String, String)> = None;
+
+    for e in entries {
+        let app = e.app_name.clone().unwrap_or_default();
+        let title = e.window_title.clone().unwrap_or_default();
+        if !app.is_empty() {
+            apps.insert(app.clone());
+        }
+        let cur = (app.clone(), title.clone());
+        if last.as_ref() != Some(&cur) && (!app.is_empty() || !title.is_empty()) {
+            let line = if title.is_empty() {
+                app.clone()
+            } else if app.is_empty() {
+                title.clone()
+            } else {
+                format!("{app}: {title}")
+            };
+            lines.push(line);
+            last = Some(cur);
+        }
+    }
+
+    let apps_list: Vec<String> = apps.into_iter().collect();
+    let summary = if apps_list.is_empty() {
+        format!("Recent activity over the last {minutes} min. No window focus was captured.")
+    } else {
+        format!(
+            "Recent activity over the last {minutes} min. Apps seen: {}.",
+            apps_list.join(", ")
+        )
+    };
+    (summary, lines.join("\n"))
 }
 
 async fn recent_context_handler(Query(query): Query<SearchQuery>) -> impl IntoResponse {
@@ -557,10 +993,13 @@ async fn capture_control_get_handler() -> impl IntoResponse {
         .map(|l| l.clone())
         .unwrap_or_default();
     let frames = is_frame_capture_enabled();
+    let history_retention_days = shadow_core::get_history_retention_days()
+        .unwrap_or_else(|_| shadow_core::default_history_retention_days());
     Json(CaptureControlResponse {
         paused,
         app_allowlist,
         frames,
+        history_retention_days,
     })
 }
 
@@ -578,16 +1017,22 @@ async fn capture_control_post_handler(Json(req): Json<CaptureControlRequest>) ->
     if let Some(f) = req.frames {
         set_frame_capture_enabled(f);
     }
+    if let Some(days) = req.history_retention_days {
+        let _ = shadow_core::set_history_retention_days(days);
+    }
     let paused = CAPTURE_PAUSED.load(Ordering::Relaxed);
     let app_allowlist = allowlist_cell()
         .read()
         .map(|l| l.clone())
         .unwrap_or_default();
     let frames = is_frame_capture_enabled();
+    let history_retention_days = shadow_core::get_history_retention_days()
+        .unwrap_or_else(|_| shadow_core::default_history_retention_days());
     Json(CaptureControlResponse {
         paused,
         app_allowlist,
         frames,
+        history_retention_days,
     })
 }
 

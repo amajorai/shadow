@@ -658,7 +658,10 @@ mod linux_atspi {
         conn: &'a zbus::Connection,
         obj: &ObjectRefOwned,
     ) -> Result<AccessibleProxy<'a>> {
-        let name = obj.name().ok_or_else(|| anyhow!("object ref missing bus name"))?.clone();
+        let name = obj
+            .name()
+            .ok_or_else(|| anyhow!("object ref missing bus name"))?
+            .clone();
         let path = obj.path().clone();
         Ok(AccessibleProxy::builder(conn)
             .destination(name)?
@@ -678,8 +681,12 @@ mod linux_atspi {
     async fn active_window(conn: &zbus::Connection) -> Result<ObjectRefOwned> {
         let root = root(conn).await?;
         for app in root.get_children().await? {
-            let Ok(app_proxy) = accessible(conn, &app).await else { continue };
-            let Ok(windows) = app_proxy.get_children().await else { continue };
+            let Ok(app_proxy) = accessible(conn, &app).await else {
+                continue;
+            };
+            let Ok(windows) = app_proxy.get_children().await else {
+                continue;
+            };
             for win in windows {
                 if let Ok(win_proxy) = accessible(conn, &win).await {
                     if let Ok(state) = win_proxy.get_state().await {
@@ -705,12 +712,19 @@ mod linux_atspi {
             .await
             .ok()?;
         let (x, y, w, h) = component.get_extents(CoordType::Screen).await.ok()?;
-        Some(Bounds { x, y, width: w.unsigned_abs(), height: h.unsigned_abs() })
+        Some(Bounds {
+            x,
+            y,
+            width: w.unsigned_abs(),
+            height: h.unsigned_abs(),
+        })
     }
 
     fn walk<'a>(conn: &'a zbus::Connection, obj: ObjectRefOwned, depth: u32) -> NodeFuture<'a> {
         Box::pin(async move {
-            let Ok(proxy) = accessible(conn, &obj).await else { return placeholder() };
+            let Ok(proxy) = accessible(conn, &obj).await else {
+                return placeholder();
+            };
             let role = proxy
                 .get_role()
                 .await
@@ -729,7 +743,14 @@ mod linux_atspi {
                 }
             }
 
-            AXTreeNode { role, title, value: None, identifier, bounds, children }
+            AXTreeNode {
+                role,
+                title,
+                value: None,
+                identifier,
+                bounds,
+                children,
+            }
         })
     }
 
@@ -785,9 +806,24 @@ impl AXTree for LinuxAXTree {
 #[cfg(target_os = "linux")]
 fn find_in_tree_linux(node: &AXTreeNode, query: &str) -> Option<AXTreeNode> {
     if node.role.to_lowercase().contains(query)
-        || node.title.as_deref().unwrap_or("").to_lowercase().contains(query)
-        || node.value.as_deref().unwrap_or("").to_lowercase().contains(query)
-        || node.identifier.as_deref().unwrap_or("").to_lowercase().contains(query)
+        || node
+            .title
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains(query)
+        || node
+            .value
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains(query)
+        || node
+            .identifier
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains(query)
     {
         return Some(node.clone());
     }

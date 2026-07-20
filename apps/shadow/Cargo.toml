@@ -1,6 +1,6 @@
 [package]
 name = "shadow"
-version = "0.0.1"
+version = "0.0.8"
 edition = "2021"
 
 [[bin]]
@@ -8,10 +8,11 @@ name = "shadow"
 path = "src/main.rs"
 
 [dependencies]
-shadow-core = { path = "../../crates/shadow-core", package = "ryu-shadow-core" }
-ghost-core = { path = "../../crates/ghost-core" }
-ghost-eyes = { path = "../../crates/ghost-eyes" }
-ghost-hands = { path = "../../crates/ghost-hands" }
+shadow-core = { path = "../../crates/ghost/shadow", package = "ryu-shadow-core" }
+ghost-core = { path = "../../crates/ghost/core" }
+ghost-eyes = { path = "../../crates/ghost/eyes" }
+ghost-hands = { path = "../../crates/ghost/hands" }
+ghost-permissions = { path = "../../crates/ghost/permissions" }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 axum = { version = "0.8", features = ["ws"] }
@@ -29,13 +30,14 @@ reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.40.0", features = ["bundled"] }
 
 # Capture dependencies
 cpal = "0.16"  # Cross-platform audio
 image = "0.25"  # Image processing
 regex = "1"  # For parsing coordinates
 hound = "3"  # WAV writing
+rubato = "0.15"  # High-quality band-limited resampling (anti-aliased 48k→16k for ASR)
 rmp-serde = "1"  # MessagePack serialization for events
 rmpv = "1"  # MessagePack value types
 base64 = "0.22"  # Base64 encoding for screenshot tool

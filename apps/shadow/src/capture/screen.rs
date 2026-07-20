@@ -565,16 +565,35 @@ fn quick_screenshot_sync(display_id: u32) -> Result<Frame> {
     };
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
+    // Resolve the target monitor's virtual-desktop rect so a chosen display is
+    // captured (not always the primary). Falls back to the primary fullscreen when
+    // the id is unknown, preserving the original behaviour.
+    let (origin_x, origin_y, w, h) = {
+        let outputs = enumerate_dxgi_outputs();
+        match outputs.iter().find(|o| o.id == display_id) {
+            Some(o) => (o.left, o.top, o.width, o.height),
+            None => unsafe {
+                (
+                    0,
+                    0,
+                    GetSystemMetrics(SM_CXSCREEN) as u32,
+                    GetSystemMetrics(SM_CYSCREEN) as u32,
+                )
+            },
+        }
+    };
+
     unsafe {
         let screen_dc = GetDC(None);
-        let w = GetSystemMetrics(SM_CXSCREEN) as u32;
-        let h = GetSystemMetrics(SM_CYSCREEN) as u32;
 
         let mem_dc = CreateCompatibleDC(Some(screen_dc));
         let bm = CreateCompatibleBitmap(screen_dc, w as i32, h as i32);
         // SelectObject takes HGDIOBJ — cast via Into
         let old = SelectObject(mem_dc, HGDIOBJ(bm.0));
 
+        // Source origin is the monitor's top-left in virtual-desktop coordinates
+        // (relative to the primary monitor's origin), so a monitor left/above the
+        // primary reads from negative coordinates.
         let _ = BitBlt(
             mem_dc,
             0,
@@ -582,8 +601,8 @@ fn quick_screenshot_sync(display_id: u32) -> Result<Frame> {
             w as i32,
             h as i32,
             Some(screen_dc),
-            0,
-            0,
+            origin_x,
+            origin_y,
             SRCCOPY,
         );
 
@@ -673,4 +692,169 @@ pub fn get_primary_display_size() -> (u32, u32) {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     (1920, 1080)
+}
+
+// ─── Capture-source enumeration (for the clips source picker) ─────────────────
+
+/// Enumerate the connected displays. On Windows this reads the DXGI output
+/// descriptors (no duplication, so it never contends with the passive engine);
+/// elsewhere it reuses the platform capturer's display list. Ids match the space
+/// [`quick_screenshot`] resolves, so a picked `id` captures that monitor.
+pub fn enumerate_displays() -> Vec<DisplayInfo> {
+    #[cfg(target_os = "windows")]
+    {
+        enumerate_dxgi_outputs()
+            .into_iter()
+            .map(|o| DisplayInfo {
+                id: o.id,
+                width: o.width,
+                height: o.height,
+                is_primary: o.primary,
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        match PlatformScreenCapture::new() {
+            Ok(cap) => cap.get_displays(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// Enumerate capturable top-level windows as `(windowId, title)`. Best-effort:
+/// Windows lists visible, titled top-level windows; other platforms return an
+/// empty list (no per-window source there yet).
+pub fn enumerate_windows() -> Vec<(u64, String)> {
+    #[cfg(target_os = "windows")]
+    {
+        enumerate_windows_win()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct DxgiOutput {
+    id: u32,
+    left: i32,
+    top: i32,
+    width: u32,
+    height: u32,
+    primary: bool,
+}
+
+/// Enumerate DXGI outputs (monitors) with their virtual-desktop coordinates.
+/// Reads descriptors only (no `DuplicateOutput`), so it is cheap and safe to call
+/// alongside the running capture engine. Ids are assigned in enumeration order and
+/// the primary is the output anchored at the virtual-desktop origin (0, 0).
+#[cfg(target_os = "windows")]
+fn enumerate_dxgi_outputs() -> Vec<DxgiOutput> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+
+    let mut outputs = Vec::new();
+    unsafe {
+        let factory: IDXGIFactory1 = match CreateDXGIFactory1() {
+            Ok(f) => f,
+            Err(_) => return outputs,
+        };
+        let mut adapter_idx = 0u32;
+        let mut id = 0u32;
+        loop {
+            let adapter = match factory.EnumAdapters1(adapter_idx) {
+                Ok(a) => a,
+                Err(_) => break,
+            };
+            let mut output_idx = 0u32;
+            loop {
+                let output = match adapter.EnumOutputs(output_idx) {
+                    Ok(o) => o,
+                    Err(_) => break,
+                };
+                if let Ok(desc) = output.GetDesc() {
+                    let r = desc.DesktopCoordinates;
+                    let width = (r.right - r.left).unsigned_abs();
+                    let height = (r.bottom - r.top).unsigned_abs();
+                    if width > 0 && height > 0 {
+                        outputs.push(DxgiOutput {
+                            id,
+                            left: r.left,
+                            top: r.top,
+                            width,
+                            height,
+                            primary: r.left == 0 && r.top == 0,
+                        });
+                        id += 1;
+                    }
+                }
+                output_idx += 1;
+            }
+            adapter_idx += 1;
+        }
+    }
+    outputs
+}
+
+/// The display id (in [`enumerate_dxgi_outputs`] order) a window sits on, matched
+/// by the window's monitor rect. `None` when the window or its monitor can't be
+/// resolved.
+#[cfg(target_os = "windows")]
+pub fn display_id_for_window(window_id: u64) -> Option<u32> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    unsafe {
+        let hwnd = HWND(window_id as usize as *mut core::ffi::c_void);
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+        let rc = info.rcMonitor;
+        enumerate_dxgi_outputs()
+            .into_iter()
+            .find(|o| o.left == rc.left && o.top == rc.top)
+            .map(|o| o.id)
+    }
+}
+
+/// List visible, titled top-level windows via `EnumWindows`.
+#[cfg(target_os = "windows")]
+fn enumerate_windows_win() -> Vec<(u64, String)> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+    };
+
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let out = &mut *(lparam.0 as *mut Vec<(u64, String)>);
+        if IsWindowVisible(hwnd).as_bool() {
+            let len = GetWindowTextLengthW(hwnd);
+            if len > 0 {
+                let mut buf = vec![0u16; len as usize + 1];
+                let n = GetWindowTextW(hwnd, &mut buf);
+                if n > 0 {
+                    let title = String::from_utf16_lossy(&buf[..n as usize]);
+                    if !title.trim().is_empty() {
+                        out.push((hwnd.0 as usize as u64, title));
+                    }
+                }
+            }
+        }
+        TRUE
+    }
+
+    let mut out: Vec<(u64, String)> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(enum_cb), LPARAM(&mut out as *mut _ as isize));
+    }
+    out
 }

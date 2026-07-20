@@ -555,9 +555,7 @@ impl InputMonitor for LinuxInputMonitor {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_pointer_pos(
-    x11: &Option<(x11rb::rust_connection::RustConnection, usize)>,
-) -> (i32, i32) {
+fn linux_pointer_pos(x11: &Option<(x11rb::rust_connection::RustConnection, usize)>) -> (i32, i32) {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
     if let Some((conn, sn)) = x11 {
@@ -597,8 +595,12 @@ fn linux_read_device(mut dev: evdev::Device, tx: tokio::sync::mpsc::UnboundedSen
                         }
                     }
                     _ => match ev.value() {
-                        1 => Some(InputEvent::KeyDown { vk_code: key.0 as u32 }),
-                        0 => Some(InputEvent::KeyUp { vk_code: key.0 as u32 }),
+                        1 => Some(InputEvent::KeyDown {
+                            vk_code: key.0 as u32,
+                        }),
+                        0 => Some(InputEvent::KeyUp {
+                            vk_code: key.0 as u32,
+                        }),
                         _ => None, // 2 = autorepeat
                     },
                 },

@@ -2,6 +2,7 @@ pub mod context;
 pub mod delivery_manager;
 pub mod embeddings;
 pub mod grounding;
+pub mod journal_narrator;
 pub mod lora;
 pub mod meeting;
 pub mod model_manager;

@@ -37,6 +37,16 @@ Continuous screen + audio capture is inherently sensitive. Shadow is a device-bo
 locally, never routes capture off-device, and gates every source behind explicit consent and a pause
 control. It's open-source so this is fully auditable. See [SECURITY](./apps/shadow/SECURITY.md).
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=amajorai%2Fshadow&type=date&legend=top-left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=amajorai/shadow&type=date&theme=dark&legend=top-left" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=amajorai/shadow&type=date&legend=top-left" />
+    <img alt="Star History Chart" src="https://api.star-history.com/image?repos=amajorai/shadow&type=date&legend=top-left" />
+  </picture>
+</a>
+
 ## Credits & license
 
 Shadow is derived from [Shadow](https://github.com/ghostwright/shadow) by Ghostwright (MIT). The

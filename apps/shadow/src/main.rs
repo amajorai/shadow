@@ -168,6 +168,21 @@ async fn main() -> anyhow::Result<()> {
                 episode_store.clone(),
             ));
 
+            // 7.9. Preflight the OS capabilities capture needs (screen recording,
+            // accessibility, input monitoring). Shadow is a background service and
+            // cannot show permission dialogs itself — when run under the desktop
+            // app the grant comes from there; standalone, the user grants once via
+            // System Settings (or `ghost setup`). Missing permissions are logged
+            // loudly rather than failing capture silently.
+            for cap in ghost_permissions::ALL {
+                if ghost_permissions::required(cap) && !ghost_permissions::granted(cap) {
+                    tracing::warn!(
+                        "{} permission not granted — capture will be degraded until it is enabled in System Settings > Privacy & Security",
+                        cap.label()
+                    );
+                }
+            }
+
             // 8. Start capture engine
             let mut capture_engine = capture_engine::CaptureEngine::new()?;
             capture_engine.set_data_dir(config.data_dir.clone());
@@ -287,9 +302,11 @@ async fn main() -> anyhow::Result<()> {
             // unbounded on disk. Delete keyframes older than the total retention
             // window (hot + warm days) once on startup, then daily.
             {
-                let retain_days = (config.retention.hot_days + config.retention.warm_days) as u64;
                 tokio::spawn(async move {
                     loop {
+                        let retain_days = shadow_core::get_history_retention_days()
+                            .unwrap_or_else(|_| shadow_core::default_history_retention_days())
+                            as u64;
                         let now_us = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_micros() as u64)
