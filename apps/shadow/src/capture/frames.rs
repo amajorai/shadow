@@ -141,8 +141,7 @@ pub fn extract_keyframes(
             // Fall back to the duration-aware sampler so ingest never returns an
             // empty keyframe set (recommendedMoments must be non-empty).
             if set.frames.is_empty() {
-                set.frames =
-                    extract_efficient(mp4, out_dir, start_ms, end_ms, duration_ms, width)?;
+                set.frames = extract_efficient(mp4, out_dir, start_ms, end_ms, duration_ms, width)?;
                 if !set.frames.is_empty() {
                     set.scan_warning = Some(
                         "no scene changes crossed the threshold; sampled at a fixed interval"
@@ -209,9 +208,8 @@ fn extract_scene(
     // metadata sink uses a *relative* filename so we can side-step ffmpeg
     // filter-graph path escaping (colons/backslashes on Windows) by running with
     // `current_dir = out_dir`.
-    let vf = format!(
-        "select='gt(scene,{threshold})',metadata=print:file={meta_name},scale={width}:-1"
-    );
+    let vf =
+        format!("select='gt(scene,{threshold})',metadata=print:file={meta_name},scale={width}:-1");
     run_ffmpeg_extract(mp4, out_dir, &vf, start_ms, end_ms)?;
 
     let pts_times = parse_pts_times(&out_dir.join(meta_name));
@@ -402,7 +400,11 @@ fn parse_pts_times(meta_path: &Path) -> Vec<f64> {
 fn gray_thumb(path: &Path) -> Option<Vec<u8>> {
     let img = image::open(path).ok()?;
     let small = img
-        .resize_exact(THUMB_EDGE, THUMB_EDGE, image::imageops::FilterType::Triangle)
+        .resize_exact(
+            THUMB_EDGE,
+            THUMB_EDGE,
+            image::imageops::FilterType::Triangle,
+        )
         .to_luma8();
     Some(small.into_raw())
 }

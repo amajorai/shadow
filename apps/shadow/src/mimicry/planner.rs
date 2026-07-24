@@ -132,3 +132,48 @@ fn extract_json_object(s: &str) -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_failure_action_maps_known_variants() {
+        assert!(matches!(parse_failure_action("skip"), StepFailureAction::Skip));
+        assert!(matches!(parse_failure_action("retry"), StepFailureAction::Retry));
+        assert!(matches!(
+            parse_failure_action("escalate"),
+            StepFailureAction::Escalate
+        ));
+    }
+
+    #[test]
+    fn parse_failure_action_defaults_to_abort() {
+        assert!(matches!(parse_failure_action("abort"), StepFailureAction::Abort));
+        assert!(matches!(parse_failure_action("bogus"), StepFailureAction::Abort));
+        assert!(matches!(parse_failure_action(""), StepFailureAction::Abort));
+    }
+
+    #[test]
+    fn extract_json_object_balances_nested_braces() {
+        let s = "prefix {\"a\": {\"b\": 1}} suffix";
+        assert_eq!(extract_json_object(s).unwrap(), "{\"a\": {\"b\": 1}}");
+    }
+
+    #[test]
+    fn extract_json_object_takes_first_complete_object() {
+        let s = "{\"first\": 1} {\"second\": 2}";
+        assert_eq!(extract_json_object(s).unwrap(), "{\"first\": 1}");
+    }
+
+    #[test]
+    fn extract_json_object_none_when_no_brace() {
+        assert_eq!(extract_json_object("no json"), None);
+    }
+
+    #[test]
+    fn extract_json_object_none_when_unbalanced() {
+        // Opening brace never closes → depth never returns to zero.
+        assert_eq!(extract_json_object("{\"a\": 1"), None);
+    }
+}

@@ -117,3 +117,98 @@ fn row_to_directive(row: &rusqlite::Row<'_>) -> rusqlite::Result<Directive> {
         created_at: row.get::<_, i64>(7)? as u64,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("shadow-directive-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn directive(id: &str, dtype: &str, content: &str, priority: u8) -> Directive {
+        Directive {
+            id: id.to_string(),
+            directive_type: dtype.to_string(),
+            content: content.to_string(),
+            trigger_pattern: None,
+            action: None,
+            priority,
+            expires_at: None,
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn create_then_list_active_returns_it() {
+        let path = temp_db();
+        let store = DirectiveMemoryStore::new(&path).unwrap();
+        store.create(&directive("d1", "reminder", "call back", 5)).unwrap();
+        let active = store.list_active(None).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "d1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_active_orders_by_priority_desc() {
+        let path = temp_db();
+        let store = DirectiveMemoryStore::new(&path).unwrap();
+        store.create(&directive("lo", "reminder", "low", 1)).unwrap();
+        store.create(&directive("hi", "reminder", "high", 9)).unwrap();
+        let active = store.list_active(None).unwrap();
+        assert_eq!(active[0].id, "hi");
+        assert_eq!(active[1].id, "lo");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_active_filters_by_type() {
+        let path = temp_db();
+        let store = DirectiveMemoryStore::new(&path).unwrap();
+        store.create(&directive("r", "reminder", "a", 5)).unwrap();
+        store.create(&directive("h", "habit", "b", 5)).unwrap();
+        let reminders = store.list_active(Some("reminder")).unwrap();
+        assert_eq!(reminders.len(), 1);
+        assert_eq!(reminders[0].directive_type, "reminder");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn completed_directives_are_excluded() {
+        let path = temp_db();
+        let store = DirectiveMemoryStore::new(&path).unwrap();
+        store.create(&directive("d1", "reminder", "done", 5)).unwrap();
+        store.complete("d1").unwrap();
+        assert!(store.list_active(None).unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expired_directives_are_excluded() {
+        let path = temp_db();
+        let store = DirectiveMemoryStore::new(&path).unwrap();
+        let mut d = directive("d1", "reminder", "stale", 5);
+        d.expires_at = Some(1); // 1 microsecond since epoch → long past.
+        store.create(&d).unwrap();
+        assert!(store.list_active(None).unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn check_triggers_matches_case_insensitive_substring() {
+        let path = temp_db();
+        let store = DirectiveMemoryStore::new(&path).unwrap();
+        let mut d = directive("d1", "watch", "watch for invoices", 5);
+        d.trigger_pattern = Some("Invoice".to_string());
+        store.create(&d).unwrap();
+        // Directive without a trigger must never match.
+        store.create(&directive("d2", "reminder", "no trigger", 5)).unwrap();
+
+        let matched = store.check_triggers("New INVOICE from vendor").unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].id, "d1");
+        assert!(store.check_triggers("unrelated context").unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+}

@@ -147,3 +147,113 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         created_at: row.get::<_, i64>(7)? as u64,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("shadow-semantic-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn entry(id: &str, category: &str, content: &str, confidence: f32) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            category: category.to_string(),
+            content: content.to_string(),
+            confidence,
+            source_episode_id: None,
+            access_count: 0,
+            last_accessed: 0,
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn upsert_then_query_by_text_substring() {
+        let path = temp_db();
+        let store = SemanticMemoryStore::new(&path).unwrap();
+        store
+            .upsert(&entry("1", "preference", "Prefers dark mode", 0.9))
+            .unwrap();
+
+        let hits = store.query(None, "dark").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "1");
+        // Query is case-insensitive.
+        assert_eq!(store.query(None, "DARK MODE").unwrap().len(), 1);
+        assert!(store.query(None, "nonexistent").unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn query_filters_by_category() {
+        let path = temp_db();
+        let store = SemanticMemoryStore::new(&path).unwrap();
+        store.upsert(&entry("a", "habit", "drinks coffee", 0.8)).unwrap();
+        store.upsert(&entry("b", "skill", "drinks tea recipe", 0.8)).unwrap();
+
+        let habits = store.query(Some("habit"), "drinks").unwrap();
+        assert_eq!(habits.len(), 1);
+        assert_eq!(habits[0].category, "habit");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upsert_dedups_by_category_and_content_keeping_max_confidence() {
+        let path = temp_db();
+        let store = SemanticMemoryStore::new(&path).unwrap();
+        store.upsert(&entry("id1", "habit", "same fact", 0.5)).unwrap();
+        // Same category+content, higher confidence, different id → updates in place.
+        store.upsert(&entry("id2", "habit", "same fact", 0.9)).unwrap();
+
+        let all = store.list_by_category("habit").unwrap();
+        assert_eq!(all.len(), 1, "duplicate content must not create a second row");
+        assert!((all[0].confidence - 0.9).abs() < 1e-5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upsert_lower_confidence_does_not_lower_stored_value() {
+        let path = temp_db();
+        let store = SemanticMemoryStore::new(&path).unwrap();
+        store.upsert(&entry("id1", "habit", "fact", 0.9)).unwrap();
+        store.upsert(&entry("id2", "habit", "fact", 0.4)).unwrap();
+        let all = store.list_by_category("habit").unwrap();
+        assert!((all[0].confidence - 0.9).abs() < 1e-5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn query_increments_access_count() {
+        let path = temp_db();
+        let store = SemanticMemoryStore::new(&path).unwrap();
+        store.upsert(&entry("1", "preference", "likes vim", 0.9)).unwrap();
+        let _ = store.query(None, "vim").unwrap();
+        let after = store.list_by_category("preference").unwrap();
+        assert!(after[0].access_count >= 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_by_category_orders_by_confidence_desc() {
+        let path = temp_db();
+        let store = SemanticMemoryStore::new(&path).unwrap();
+        store.upsert(&entry("lo", "project", "alpha task", 0.3)).unwrap();
+        store.upsert(&entry("hi", "project", "beta task", 0.95)).unwrap();
+        let list = store.list_by_category("project").unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].confidence >= list[1].confidence);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_removes_entry() {
+        let path = temp_db();
+        let store = SemanticMemoryStore::new(&path).unwrap();
+        store.upsert(&entry("1", "habit", "gone soon", 0.5)).unwrap();
+        store.delete("1").unwrap();
+        assert!(store.list_by_category("habit").unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+}

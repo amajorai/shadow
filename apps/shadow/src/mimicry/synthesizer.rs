@@ -243,3 +243,158 @@ fn event_to_tool(e: &LearnedEvent) -> (String, serde_json::Value) {
         _ => ("ax_wait".to_string(), serde_json::json!({"ms": 500})),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(event_type: &str) -> LearnedEvent {
+        LearnedEvent {
+            ts_ms: 0,
+            event_type: event_type.to_string(),
+            x: None,
+            y: None,
+            key: None,
+            element_role: None,
+            element_name: None,
+            element_id: None,
+            app_name: Some("Mail".to_string()),
+        }
+    }
+
+    #[test]
+    fn describe_event_click_prefers_element_name() {
+        let mut e = ev("click");
+        e.element_name = Some("Send".to_string());
+        e.element_role = Some("button".to_string());
+        assert_eq!(describe_event(&e), "Clicked 'Send' button in Mail");
+    }
+
+    #[test]
+    fn describe_event_click_falls_back_to_element_id_then_defaults() {
+        let mut e = ev("click");
+        e.element_id = Some("btn-42".to_string());
+        assert_eq!(describe_event(&e), "Clicked 'btn-42' control in Mail");
+
+        let bare = ev("click");
+        assert_eq!(describe_event(&bare), "Clicked 'element' control in Mail");
+    }
+
+    #[test]
+    fn describe_event_covers_type_hotkey_scroll_switch_and_other() {
+        let mut typed = ev("type");
+        typed.key = Some("hello".to_string());
+        assert_eq!(describe_event(&typed), "Typed 'hello' in Mail");
+
+        let mut hk = ev("hotkey");
+        hk.key = Some("cmd+s".to_string());
+        assert_eq!(describe_event(&hk), "Pressed hotkey cmd+s in Mail");
+
+        assert_eq!(describe_event(&ev("scroll")), "Scrolled in Mail");
+        assert_eq!(describe_event(&ev("app_switch")), "Switched to Mail");
+        assert_eq!(describe_event(&ev("drag")), "drag in Mail");
+    }
+
+    #[test]
+    fn describe_event_defaults_app_when_missing() {
+        let mut e = ev("scroll");
+        e.app_name = None;
+        assert_eq!(describe_event(&e), "Scrolled in app");
+    }
+
+    #[test]
+    fn events_to_descriptions_maps_each_event() {
+        let events = vec![ev("scroll"), ev("app_switch")];
+        let descs = events_to_descriptions(&events);
+        assert_eq!(descs, vec!["Scrolled in Mail", "Switched to Mail"]);
+    }
+
+    #[test]
+    fn build_synthesis_prompt_numbers_steps_and_names_app() {
+        let prompt = build_synthesis_prompt(&["Clicked X".to_string(), "Typed Y".to_string()], "Mail");
+        assert!(prompt.contains("recorded actions in Mail"));
+        assert!(prompt.contains("1. Clicked X"));
+        assert!(prompt.contains("2. Typed Y"));
+        assert!(prompt.contains("{{PLACEHOLDER}}"));
+    }
+
+    #[test]
+    fn event_to_tool_click_with_name_uses_query() {
+        let mut e = ev("click");
+        e.element_name = Some("Compose".to_string());
+        let (tool, args) = event_to_tool(&e);
+        assert_eq!(tool, "ax_click");
+        assert_eq!(args["query"], serde_json::json!("Compose"));
+    }
+
+    #[test]
+    fn event_to_tool_click_without_name_uses_coordinates() {
+        let mut e = ev("click");
+        e.x = Some(10);
+        e.y = Some(20);
+        let (tool, args) = event_to_tool(&e);
+        assert_eq!(tool, "ax_click");
+        assert_eq!(args["x"], serde_json::json!(10));
+        assert_eq!(args["y"], serde_json::json!(20));
+    }
+
+    #[test]
+    fn event_to_tool_maps_type_hotkey_scroll_switch_and_default() {
+        let mut typed = ev("type");
+        typed.key = Some("hi".to_string());
+        assert_eq!(event_to_tool(&typed), ("ax_type".to_string(), serde_json::json!({"text": "hi"})));
+
+        let mut hk = ev("hotkey");
+        hk.key = Some("cmd+c".to_string());
+        assert_eq!(event_to_tool(&hk), ("ax_hotkey".to_string(), serde_json::json!({"keys": "cmd+c"})));
+
+        let (scroll_tool, scroll_args) = event_to_tool(&ev("scroll"));
+        assert_eq!(scroll_tool, "ax_scroll");
+        assert_eq!(scroll_args["direction"], serde_json::json!("down"));
+
+        let (switch_tool, switch_args) = event_to_tool(&ev("app_switch"));
+        assert_eq!(switch_tool, "ax_focus_app");
+        assert_eq!(switch_args["app"], serde_json::json!("Mail"));
+
+        let (default_tool, _) = event_to_tool(&ev("unknown"));
+        assert_eq!(default_tool, "ax_wait");
+    }
+
+    #[test]
+    fn heuristic_synthesis_builds_a_step_per_event() {
+        let events = vec![ev("scroll"), ev("app_switch")];
+        let template = heuristic_synthesis(&events, "Mail");
+        assert_eq!(template.steps.len(), 2);
+        assert_eq!(template.app_name, "Mail");
+        assert!(template.name.contains("Mail"));
+        assert_eq!(template.steps[0].step_number, 1);
+        assert_eq!(template.steps[1].step_number, 2);
+        // Heuristic steps use Skip on failure.
+        assert!(matches!(template.steps[0].on_failure, StepFailureAction::Skip));
+    }
+
+    #[test]
+    fn parse_template_extracts_named_steps() {
+        let text = "{\"name\":\"Compose email\",\"description\":\"send a mail\",\"steps\":[\
+            {\"tool_name\":\"ax_click\",\"description\":\"click compose\",\"tool_args\":{},\"on_failure\":\"retry\"}\
+        ]}";
+        let events = vec![ev("click"), ev("type")];
+        let template = parse_template(text, &events, "Mail").unwrap();
+        assert_eq!(template.name, "Compose email");
+        assert_eq!(template.description, "send a mail");
+        assert_eq!(template.steps.len(), 1);
+        assert_eq!(template.steps[0].tool_name, "ax_click");
+        assert!(matches!(template.steps[0].on_failure, StepFailureAction::Retry));
+    }
+
+    #[test]
+    fn parse_template_returns_none_when_no_steps() {
+        let text = "{\"name\":\"Empty\",\"steps\":[]}";
+        assert!(parse_template(text, &[], "Mail").is_none());
+    }
+
+    #[test]
+    fn parse_template_returns_none_on_invalid_json() {
+        assert!(parse_template("not json", &[], "Mail").is_none());
+    }
+}

@@ -318,6 +318,21 @@ fn clips_root() -> PathBuf {
     data_root().join("media").join("clips")
 }
 
+/// Whether `id` is a well-formed clip id, safe to join under `clips_root()`.
+///
+/// Ids are minted as `clip_<uuid-simple>` ([`start`]/[`ingest`]), so the legal
+/// charset is `[A-Za-z0-9_-]`. This must be checked before any path join with an
+/// externally supplied id: axum's `Path` extractor percent-decodes, so a route
+/// param of `..%2f..%2f..` arrives here as `../../..` and would otherwise escape
+/// the clips root (read arbitrary dirs' `clip.mp4`/`agent-context.json`, or
+/// write `diagnostics.json` outside it).
+pub fn is_valid_clip_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 fn clip_dir(id: &str) -> PathBuf {
     clips_root().join(id)
 }
@@ -514,7 +529,9 @@ pub fn start(opts: ClipStartOpts) -> anyhow::Result<ClipContext> {
         match build_loopback_stream(&host) {
             Ok((stream, buf)) => (Some(stream), Some(buf)),
             Err(e) => {
-                tracing::warn!("clip: system-audio loopback unavailable ({e}); recording without it");
+                tracing::warn!(
+                    "clip: system-audio loopback unavailable ({e}); recording without it"
+                );
                 (None, None)
             }
         }
@@ -555,10 +572,7 @@ fn resolve_capture_display(opts: &ClipStartOpts) -> (u32, Option<String>) {
     };
     match target.kind {
         ClipTargetKind::Screen => (0, None),
-        ClipTargetKind::Display => (
-            target.display_id.or(opts.display_id).unwrap_or(0),
-            None,
-        ),
+        ClipTargetKind::Display => (target.display_id.or(opts.display_id).unwrap_or(0), None),
         ClipTargetKind::Window => match target.window_id {
             Some(window_id) => {
                 let display = window_display_id(window_id).unwrap_or(0);
@@ -713,8 +727,8 @@ pub fn stop() -> anyhow::Result<Option<ClipContext>> {
     // diagnostics arrived during the recording.
     let now_ms = chrono::Utc::now().timestamp_millis();
     let paused_ms = total_paused_ms(&recorder, now_ms);
-    let duration_ms = (now_ms.saturating_sub(recorder.t0_epoch_ms).max(0) as u64)
-        .saturating_sub(paused_ms);
+    let duration_ms =
+        (now_ms.saturating_sub(recorder.t0_epoch_ms).max(0) as u64).saturating_sub(paused_ms);
 
     let mut context = read_context(&id).unwrap_or_else(|_| ClipContext {
         id: id.clone(),
@@ -748,6 +762,9 @@ pub fn stop() -> anyhow::Result<Option<ClipContext>> {
 
 /// Read a clip's manifest (`agent-context.json`).
 pub fn read_context(id: &str) -> anyhow::Result<ClipContext> {
+    if !is_valid_clip_id(id) {
+        anyhow::bail!("invalid clip id");
+    }
     let bytes = std::fs::read(context_path(id))?;
     let ctx: ClipContext = serde_json::from_slice(&bytes)?;
     Ok(ctx)
@@ -783,6 +800,9 @@ pub fn list() -> anyhow::Result<Vec<ClipSummary>> {
 /// Append diagnostics to a clip, recompute recommended moments into the manifest,
 /// and return the new total event count.
 pub fn append_diagnostics(id: &str, events: Vec<DiagnosticEvent>) -> anyhow::Result<usize> {
+    if !is_valid_clip_id(id) {
+        anyhow::bail!("invalid clip id");
+    }
     let path = diagnostics_path(id);
     let mut doc: DiagnosticsDoc = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
@@ -805,6 +825,9 @@ pub fn append_diagnostics(id: &str, events: Vec<DiagnosticEvent>) -> anyhow::Res
 /// the on-demand cache (`frames/at-<atMs>.jpg`) when present, else shells ffmpeg
 /// against `clip.mp4`, else falls back to the nearest capture-time `seq-*.jpg`.
 pub fn extract_frame(id: &str, at_ms: u64) -> anyhow::Result<PathBuf> {
+    if !is_valid_clip_id(id) {
+        anyhow::bail!("invalid clip id");
+    }
     let cached = frames_dir(id).join(format!("at-{at_ms}.jpg"));
     if cached.exists() {
         return Ok(cached);
@@ -1153,7 +1176,12 @@ fn save_frame_jpeg(
 
     let img = if w > MAX_FRAME_WIDTH {
         let new_h = ((h as u64 * MAX_FRAME_WIDTH as u64) / w as u64).max(1) as u32;
-        image::imageops::resize(&rgb, MAX_FRAME_WIDTH, new_h, image::imageops::FilterType::Triangle)
+        image::imageops::resize(
+            &rgb,
+            MAX_FRAME_WIDTH,
+            new_h,
+            image::imageops::FilterType::Triangle,
+        )
     } else {
         rgb
     };
@@ -1389,22 +1417,24 @@ fn transcribe_via_core(bytes: Vec<u8>, engine: Option<&str>) -> TranscriptDoc {
         let form = reqwest::multipart::Form::new().part("file", part);
         let client = reqwest::Client::new();
         match client.post(&url).multipart(form).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
-                Ok(body) => {
-                    let text = body
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    let segments = parse_core_segments(&body);
-                    TranscriptDoc { text, segments }
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let text = body
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let segments = parse_core_segments(&body);
+                        TranscriptDoc { text, segments }
+                    }
+                    Err(e) => {
+                        tracing::warn!("clip: parsing transcription response failed: {e}");
+                        TranscriptDoc::default()
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("clip: parsing transcription response failed: {e}");
-                    TranscriptDoc::default()
-                }
-            },
+            }
             Ok(resp) => {
                 tracing::warn!("clip: transcription returned HTTP {}", resp.status());
                 TranscriptDoc::default()
@@ -1467,10 +1497,8 @@ fn core_transcribe_url(engine: Option<&str>) -> Result<String, String> {
     if parsed.port_or_known_default() != Some(CORE_PORT) {
         return Err("Core URL must use Core's loopback port".to_string());
     }
-    let mut url = reqwest::Url::parse(&format!(
-        "http://{host}:{CORE_PORT}/api/voice/transcribe"
-    ))
-    .map_err(|_| "could not build transcription URL".to_string())?;
+    let mut url = reqwest::Url::parse(&format!("http://{host}:{CORE_PORT}/api/voice/transcribe"))
+        .map_err(|_| "could not build transcription URL".to_string())?;
     if let Some(engine) = engine.map(str::trim).filter(|e| !e.is_empty()) {
         url.query_pairs_mut().append_pair("engine", engine);
     }
@@ -1508,7 +1536,9 @@ fn recommended_from_events(events: &[DiagnosticEvent]) -> Vec<RecommendedMoment>
                 let status = e.status.map(|s| s.to_string()).unwrap_or_default();
                 let method = e.method.clone().unwrap_or_default();
                 let url = e.url.clone().unwrap_or_default();
-                format!("network {status} {method} {url}").trim().to_string()
+                format!("network {status} {method} {url}")
+                    .trim()
+                    .to_string()
             }
             other => {
                 let text = e.text.clone().unwrap_or_default();
@@ -1552,6 +1582,41 @@ fn nearest_seq_frame(id: &str, at_ms: u64) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_clip_ids_pass() {
+        // The shapes `start`/`ingest` actually mint.
+        assert!(is_valid_clip_id(&format!(
+            "clip_{}",
+            uuid::Uuid::new_v4().simple()
+        )));
+        assert!(is_valid_clip_id("clip_abc-123_XYZ"));
+    }
+
+    #[test]
+    fn traversal_and_malformed_clip_ids_are_rejected() {
+        // axum's Path extractor percent-decodes, so `..%2f..` arrives as `../..`.
+        for id in [
+            "",
+            ".",
+            "..",
+            "../..",
+            "../../etc",
+            "..\\..\\windows",
+            "clip_abc/../../secrets",
+            "clip abc",
+            "clip_abc.mp4",
+        ] {
+            assert!(!is_valid_clip_id(id), "{id:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn external_id_entry_points_reject_traversal_ids() {
+        assert!(read_context("../../..").is_err());
+        assert!(append_diagnostics("../../..", Vec::new()).is_err());
+        assert!(extract_frame("../../..", 0).is_err());
+    }
 
     #[test]
     fn recommended_filters_and_clamps() {

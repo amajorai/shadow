@@ -330,3 +330,37 @@ pub fn parse_coordinates(output: &str) -> Option<(f32, f32)> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bracket_format() {
+        assert_eq!(parse_coordinates("point [0.5, 0.25]"), Some((0.5, 0.25)));
+    }
+
+    #[test]
+    fn parses_paren_format() {
+        assert_eq!(parse_coordinates("(12, 34)"), Some((12.0, 34.0)));
+    }
+
+    #[test]
+    fn parses_click_function_format() {
+        assert_eq!(
+            parse_coordinates("call click(x=100, y=200) now"),
+            Some((100.0, 200.0))
+        );
+    }
+
+    #[test]
+    fn returns_none_when_no_coordinate_present() {
+        assert_eq!(parse_coordinates("no coordinates here"), None);
+    }
+
+    #[test]
+    fn bracket_takes_precedence_over_paren() {
+        // Both present: the bracket pattern is tried first.
+        assert_eq!(parse_coordinates("[1, 2] and (3, 4)"), Some((1.0, 2.0)));
+    }
+}

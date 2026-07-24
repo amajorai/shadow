@@ -37,6 +37,62 @@ fn format_date_context(now: DateTime<Utc>) -> String {
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 23, 14, 30, 0).unwrap()
+    }
+
+    #[test]
+    fn build_system_prompt_includes_core_and_date() {
+        let out = AgentPromptBuilder::build_system_prompt(fixed_now(), "", "");
+        assert!(out.starts_with("You are Shadow"));
+        assert!(out.contains("Current date/time:"));
+        assert!(out.contains("UTC: 2026-07-23T14:30:00Z"));
+        // No context / pattern sections when both are empty.
+        assert!(!out.contains("## Recent Context"));
+        assert!(!out.contains("## Relevant Patterns"));
+    }
+
+    #[test]
+    fn build_system_prompt_appends_context_and_patterns_when_present() {
+        let out = AgentPromptBuilder::build_system_prompt(
+            fixed_now(),
+            "opened Mail",
+            "usually replies within 5 min",
+        );
+        assert!(out.contains("## Recent Context\nopened Mail"));
+        assert!(out.contains("## Relevant Patterns\nusually replies within 5 min"));
+        // Sections are joined by a blank line.
+        assert!(out.contains("\n\n## Recent Context"));
+    }
+
+    #[test]
+    fn build_system_prompt_context_only_omits_patterns_section() {
+        let out = AgentPromptBuilder::build_system_prompt(fixed_now(), "ctx", "");
+        assert!(out.contains("## Recent Context\nctx"));
+        assert!(!out.contains("## Relevant Patterns"));
+    }
+
+    #[test]
+    fn role_prompt_delegates_to_context_budget() {
+        let observer = AgentPromptBuilder::role_prompt(AgentRole::Observer);
+        let executor = AgentPromptBuilder::role_prompt(AgentRole::Executor);
+        assert!(!observer.is_empty());
+        assert_ne!(observer, executor);
+    }
+
+    #[test]
+    fn format_date_context_contains_both_local_and_utc() {
+        let s = format_date_context(fixed_now());
+        assert!(s.starts_with("Current date/time: "));
+        assert!(s.contains("(UTC: 2026-07-23T14:30:00Z)"));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core static prompt (ported from Swift AgentPromptBuilder.swift, 465 lines)
 // ---------------------------------------------------------------------------

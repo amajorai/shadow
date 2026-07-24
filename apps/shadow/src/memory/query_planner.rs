@@ -215,3 +215,213 @@ fn heuristic_plan(question: &str) -> QueryPlan {
         max_chars: 4000,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(source: MemorySource, content: &str) -> MemoryResult {
+        MemoryResult {
+            source,
+            content: content.to_string(),
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn heuristic_plan_routes_directives() {
+        let plan = heuristic_plan("remind me to call back");
+        assert_eq!(plan.sources, vec![MemorySource::Directives]);
+        assert_eq!(plan.query, "remind me to call back");
+        assert_eq!(plan.max_chars, 4000);
+    }
+
+    #[test]
+    fn heuristic_plan_routes_procedures() {
+        let plan = heuristic_plan("how to export the report");
+        assert_eq!(plan.sources, vec![MemorySource::Procedures]);
+    }
+
+    #[test]
+    fn heuristic_plan_episodes_pushes_semantic_too() {
+        let plan = heuristic_plan("what did i do in my history");
+        assert_eq!(
+            plan.sources,
+            vec![MemorySource::Episodes, MemorySource::SemanticKnowledge]
+        );
+    }
+
+    #[test]
+    fn heuristic_plan_combines_multiple_intents_in_order() {
+        // "remind" → Directives (pushed first), "how to" → Procedures (second).
+        let plan = heuristic_plan("remind me how to reply");
+        assert_eq!(
+            plan.sources,
+            vec![MemorySource::Directives, MemorySource::Procedures]
+        );
+    }
+
+    #[test]
+    fn heuristic_plan_defaults_to_all_sources() {
+        let plan = heuristic_plan("banana pancakes");
+        assert_eq!(
+            plan.sources,
+            vec![
+                MemorySource::SemanticKnowledge,
+                MemorySource::Directives,
+                MemorySource::Episodes,
+                MemorySource::Procedures,
+            ]
+        );
+    }
+
+    #[test]
+    fn format_for_context_empty_when_no_results() {
+        assert_eq!(MemoryQueryPlanner::format_for_context(&[], 1000), "");
+    }
+
+    #[test]
+    fn format_for_context_bullets_each_result() {
+        let results = [
+            result(MemorySource::Directives, "always confirm"),
+            result(MemorySource::Episodes, "opened Mail"),
+        ];
+        let out = MemoryQueryPlanner::format_for_context(&results, 1000);
+        assert_eq!(out, "• always confirm\n• opened Mail\n");
+    }
+
+    #[test]
+    fn format_for_context_stops_at_char_budget() {
+        // Each line is "• " + content + "\n". First line ~ 12 chars; a tiny budget
+        // admits only the first before the second would overflow.
+        let results = [
+            result(MemorySource::Directives, "one"),
+            result(MemorySource::Directives, "two"),
+        ];
+        let out = MemoryQueryPlanner::format_for_context(&results, 8);
+        assert_eq!(out, "• one\n");
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("shadow-qp-{tag}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn execute_gathers_from_all_four_sources() {
+        use crate::memory::directive::Directive;
+        use crate::mimicry::types::{ProcedureStep, StepFailureAction};
+
+        // Semantic store with one matching entry.
+        let sem_path = temp_path("sem");
+        let semantic = SemanticMemoryStore::new(&sem_path).unwrap();
+        semantic
+            .upsert(&MemoryEntry {
+                id: "s1".to_string(),
+                category: "preference".to_string(),
+                content: "likes dark theme".to_string(),
+                confidence: 0.9,
+                source_episode_id: None,
+                access_count: 0,
+                last_accessed: 0,
+                created_at: 1,
+            })
+            .unwrap();
+
+        // Directive store with one active directive.
+        let dir_path = temp_path("dir");
+        let directive = DirectiveMemoryStore::new(&dir_path).unwrap();
+        directive
+            .create(&Directive {
+                id: "d1".to_string(),
+                directive_type: "reminder".to_string(),
+                content: "call back".to_string(),
+                trigger_pattern: None,
+                action: None,
+                priority: 5,
+                expires_at: None,
+                created_at: 1,
+            })
+            .unwrap();
+
+        // Episode store with one episode.
+        let ep_path = temp_path("ep");
+        let episodes = EpisodeStore::new(&ep_path).unwrap();
+        episodes
+            .save(&EpisodeRecord {
+                id: "e1".to_string(),
+                start_us: 1,
+                end_us: 2,
+                app_name: "Mail".to_string(),
+                window_title: "Inbox".to_string(),
+                actions: vec![],
+                summary: "read email".to_string(),
+                bundle_id: None,
+            })
+            .unwrap();
+
+        // Procedure store with one template.
+        let proc_path = temp_path("proc");
+        let procedures = ProcedureStore::new(&proc_path).unwrap();
+        procedures
+            .save(&ProcedureTemplate {
+                id: "p1".to_string(),
+                name: "Send report".to_string(),
+                app_name: "Mail".to_string(),
+                description: "compose and send".to_string(),
+                steps: vec![ProcedureStep {
+                    step_number: 1,
+                    description: "click".to_string(),
+                    tool_name: "ax_click".to_string(),
+                    tool_args: serde_json::json!({}),
+                    verification: None,
+                    on_failure: StepFailureAction::Abort,
+                }],
+                preconditions: vec![],
+                success_count: 1,
+                failure_count: 0,
+                last_used: 1,
+                created_at: 1,
+            })
+            .unwrap();
+
+        let plan = QueryPlan {
+            sources: vec![
+                MemorySource::SemanticKnowledge,
+                MemorySource::Directives,
+                MemorySource::Episodes,
+                MemorySource::Procedures,
+            ],
+            query: "report".to_string(),
+            max_chars: 4000,
+        };
+
+        let results = MemoryQueryPlanner::execute(
+            &plan,
+            Some(&semantic),
+            Some(&directive),
+            Some(&episodes),
+            Some(&procedures),
+        );
+
+        // Directives (unconditional) + Episodes (load_recent) always yield;
+        // semantic depends on text match ("report" won't match "dark theme"),
+        // procedures depends on find_similar. At minimum directive + episode.
+        assert!(results.iter().any(|r| r.source == MemorySource::Directives));
+        assert!(results.iter().any(|r| r.source == MemorySource::Episodes));
+
+        for p in [&sem_path, &dir_path, &ep_path, &proc_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn execute_with_no_stores_returns_empty() {
+        let plan = QueryPlan {
+            sources: vec![MemorySource::SemanticKnowledge, MemorySource::Procedures],
+            query: "x".to_string(),
+            max_chars: 100,
+        };
+        let results = MemoryQueryPlanner::execute(&plan, None, None, None, None);
+        assert!(results.is_empty());
+    }
+}

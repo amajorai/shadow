@@ -97,3 +97,101 @@ pub enum MimicryProgress {
         message: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn step_failure_action_uses_snake_case() {
+        assert_eq!(
+            serde_json::to_value(StepFailureAction::Abort).unwrap(),
+            json!("abort")
+        );
+        assert_eq!(
+            serde_json::to_value(StepFailureAction::Escalate).unwrap(),
+            json!("escalate")
+        );
+        let parsed: StepFailureAction = serde_json::from_value(json!("retry")).unwrap();
+        assert!(matches!(parsed, StepFailureAction::Retry));
+    }
+
+    #[test]
+    fn step_failure_action_rejects_unknown_variant() {
+        let r: Result<StepFailureAction, _> = serde_json::from_value(json!("boom"));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn mimicry_progress_is_internally_tagged_snake_case() {
+        let v = serde_json::to_value(MimicryProgress::StepStarted {
+            step: 3,
+            description: "click".to_string(),
+        })
+        .unwrap();
+        assert_eq!(v["type"], json!("step_started"));
+        assert_eq!(v["step"], json!(3));
+        assert_eq!(v["description"], json!("click"));
+    }
+
+    #[test]
+    fn mimicry_progress_step_failed_tag() {
+        let v = serde_json::to_value(MimicryProgress::StepFailed {
+            step: 1,
+            error: "nope".to_string(),
+        })
+        .unwrap();
+        assert_eq!(v["type"], json!("step_failed"));
+        assert_eq!(v["error"], json!("nope"));
+    }
+
+    #[test]
+    fn mimicry_progress_round_trips() {
+        let original = MimicryProgress::Replanning {
+            reason: "step 2 blocked".to_string(),
+        };
+        let s = serde_json::to_string(&original).unwrap();
+        let back: MimicryProgress = serde_json::from_str(&s).unwrap();
+        match back {
+            MimicryProgress::Replanning { reason } => assert_eq!(reason, "step 2 blocked"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn procedure_step_round_trips_with_nested_args() {
+        let step = ProcedureStep {
+            step_number: 2,
+            description: "type text".to_string(),
+            tool_name: "ax_type".to_string(),
+            tool_args: json!({"text": "hi", "into": "field"}),
+            verification: Some("value shows hi".to_string()),
+            on_failure: StepFailureAction::Skip,
+        };
+        let s = serde_json::to_string(&step).unwrap();
+        let back: ProcedureStep = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.step_number, 2);
+        assert_eq!(back.tool_args["text"], json!("hi"));
+        assert_eq!(back.verification.as_deref(), Some("value shows hi"));
+        assert!(matches!(back.on_failure, StepFailureAction::Skip));
+    }
+
+    #[test]
+    fn mimicry_result_serializes_optional_fields() {
+        let r = MimicryResult {
+            task_description: "t".to_string(),
+            success: false,
+            steps_completed: 1,
+            steps_total: 3,
+            error: Some("failed".to_string()),
+            procedure_id: None,
+            duration_ms: 42,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["success"], json!(false));
+        assert_eq!(v["steps_total"], json!(3));
+        assert_eq!(v["error"], json!("failed"));
+        assert_eq!(v["procedure_id"], json!(null));
+    }
+}

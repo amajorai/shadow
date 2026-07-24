@@ -328,3 +328,172 @@ impl PatternMatcher {
         store.record_outcome(id, success);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("shadow-pattern-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn pattern(id: &str, desc: &str, app: Option<&str>) -> AgentPattern {
+        AgentPattern {
+            id: id.to_string(),
+            task_description: desc.to_string(),
+            target_app: app.map(str::to_string),
+            url_pattern: None,
+            steps: vec![PatternStep {
+                tool_name: "ax_click".to_string(),
+                purpose: "click send".to_string(),
+                key_arguments: vec!["query".to_string()],
+                expected_outcome: "sent".to_string(),
+            }],
+            notes: "n".to_string(),
+            success_count: 0,
+            failure_count: 0,
+            created_at: 0,
+            last_used: 0,
+        }
+    }
+
+    #[test]
+    fn save_then_load_all_round_trips() {
+        let dir = temp_dir();
+        let mut store = PatternStore::new(&dir);
+        store.save(&pattern("p1", "send an email", Some("Mail")));
+        let loaded = store.load_all();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "p1");
+        assert_eq!(loaded[0].target_app.as_deref(), Some("Mail"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_all_skips_archived_patterns() {
+        let dir = temp_dir();
+        let mut store = PatternStore::new(&dir);
+        // Archived: failure_count (3) > success_count*2 + 2 (== 2).
+        let mut archived = pattern("arch", "archived task", None);
+        archived.failure_count = 3;
+        store.save(&archived);
+        // Kept: failure_count (2) <= success_count*2 + 2 (== 2).
+        let mut kept = pattern("kept", "kept task", None);
+        kept.failure_count = 2;
+        store.save(&kept);
+
+        let ids: Vec<&str> = store.load_all().iter().map(|p| p.id.as_str()).collect();
+        assert!(ids.contains(&"kept"));
+        assert!(!ids.contains(&"arch"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_relevant_excludes_zero_score_and_orders_by_score() {
+        let dir = temp_dir();
+        let mut store = PatternStore::new(&dir);
+        store.save(&pattern("match", "send email report", Some("Mail")));
+        store.save(&pattern("nomatch", "resize a photo", None));
+
+        let results = store.find_relevant("send email", "Mail", 10);
+        // Only the keyword-overlapping pattern is returned.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.id, "match");
+        assert!(results[0].1 > 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_relevant_truncates_to_limit() {
+        let dir = temp_dir();
+        let mut store = PatternStore::new(&dir);
+        for i in 0..5 {
+            store.save(&pattern(&format!("p{i}"), "open the settings panel", None));
+        }
+        let results = store.find_relevant("open the settings", "", 2);
+        assert_eq!(results.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn score_pattern_keyword_overlap_only() {
+        // No app match, no recency, no success weighting → pure keyword fraction.
+        let p = pattern("x", "send email", None);
+        let query_words = ["send", "email", "report"];
+        let score = score_pattern(&p, &query_words, "", 0);
+        // 2 of 3 query words appear in "send email": 0.5 * 2/3.
+        assert!((score - (0.5 * 2.0 / 3.0)).abs() < 1e-5, "score={score}");
+    }
+
+    #[test]
+    fn score_pattern_adds_app_match_bonus() {
+        let p = pattern("x", "send email", Some("Mail"));
+        let words = ["send", "email"]; // full overlap → 0.5
+        let with_app = score_pattern(&p, &words, "mail", 0);
+        let without_app = score_pattern(&p, &words, "browser", 0);
+        assert!((with_app - without_app - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn score_pattern_recency_bonus_within_a_day() {
+        let mut p = pattern("x", "send email", None);
+        let now = 10 * 24 * 60 * 60 * 1_000_000u64; // 10 days in micros
+        p.last_used = now - 1_000_000; // 1 second ago
+        let recent = score_pattern(&p, &["send", "email"], "", now);
+        p.last_used = now - 2 * 24 * 60 * 60 * 1_000_000; // 2 days ago
+        let stale = score_pattern(&p, &["send", "email"], "", now);
+        assert!((recent - stale - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn record_outcome_increments_and_persists() {
+        let dir = temp_dir();
+        let mut store = PatternStore::new(&dir);
+        store.save(&pattern("p1", "task", None));
+        store.record_outcome("p1", true);
+        store.record_outcome("p1", true);
+        store.record_outcome("p1", false);
+
+        let loaded = store.load_all();
+        let p = loaded.iter().find(|p| p.id == "p1").expect("p1");
+        assert_eq!(p.success_count, 2);
+        assert_eq!(p.failure_count, 1);
+        assert!(p.last_used > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_heuristic_needs_at_least_three_tools() {
+        assert!(PatternExtractor::extract_heuristic("t", &["a".into(), "b".into()]).is_none());
+        let p = PatternExtractor::extract_heuristic(
+            "do the thing",
+            &["ax_focus".into(), "ax_click".into(), "ax_type".into()],
+        )
+        .expect("pattern");
+        assert_eq!(p.steps.len(), 3);
+        assert_eq!(p.task_description, "do the thing");
+        assert_eq!(p.success_count, 1);
+        assert_eq!(p.failure_count, 0);
+    }
+
+    #[test]
+    fn format_for_prompt_empty_when_no_matches() {
+        let dir = temp_dir();
+        let mut store = PatternStore::new(&dir);
+        store.save(&pattern("p", "totally unrelated", None));
+        assert_eq!(store.format_for_prompt("xyz nonsense query", ""), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_for_prompt_includes_matched_description() {
+        let dir = temp_dir();
+        let mut store = PatternStore::new(&dir);
+        store.save(&pattern("p", "compose a new message", Some("Mail")));
+        let out = store.format_for_prompt("compose new message", "Mail");
+        assert!(out.contains("Relevant past patterns"));
+        assert!(out.contains("compose a new message"));
+        assert!(out.contains("ax_click"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

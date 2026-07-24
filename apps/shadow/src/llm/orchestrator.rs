@@ -67,3 +67,35 @@ impl LlmOrchestrator {
         self.provider.stream(req, on_token).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A remote-style config (non-empty api_key, no 11434 in the URL) takes the
+    /// non-local branch, so no Ollama probe task is spawned — fully hermetic.
+    fn remote_config() -> LlmConfig {
+        LlmConfig {
+            base_url: "http://example.invalid/v1".to_string(),
+            model: "test-model".to_string(),
+            api_key: "sk-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn remote_config_has_no_local_provider() {
+        let orch = LlmOrchestrator::new(&remote_config());
+        assert!(orch.local().is_none());
+        assert!(orch.local_unchecked().is_none());
+        // provider() hands back a usable clone.
+        let _p = orch.provider();
+    }
+
+    #[test]
+    fn local_is_none_until_probe_marks_available() {
+        // Even a local-style config starts unavailable (probe hasn't run), so
+        // local() gates to None while local_unchecked() exposes the provider.
+        let orch = LlmOrchestrator::new(&remote_config());
+        assert!(orch.local().is_none());
+    }
+}

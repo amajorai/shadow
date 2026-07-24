@@ -381,3 +381,51 @@ mod ort_impl {
 
 #[cfg(feature = "ort")]
 pub use ort_impl::CLIPEncoder;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn constant(v: f32) -> Embedding {
+        Embedding([v; 512])
+    }
+
+    #[test]
+    fn identical_vectors_have_similarity_one() {
+        let a = constant(0.5);
+        let sim = cosine_similarity(&a, &a);
+        assert!((sim - 1.0).abs() < 1e-4, "got {sim}");
+    }
+
+    #[test]
+    fn zero_magnitude_returns_zero() {
+        let zero = constant(0.0);
+        let nonzero = constant(1.0);
+        assert_eq!(cosine_similarity(&zero, &nonzero), 0.0);
+        assert_eq!(cosine_similarity(&nonzero, &zero), 0.0);
+    }
+
+    #[test]
+    fn orthogonal_vectors_have_zero_similarity() {
+        let mut a = [0.0f32; 512];
+        let mut b = [0.0f32; 512];
+        a[0] = 1.0;
+        b[1] = 1.0;
+        let sim = cosine_similarity(&Embedding(a), &Embedding(b));
+        assert!(sim.abs() < 1e-6, "got {sim}");
+    }
+
+    #[test]
+    fn opposite_vectors_have_negative_one_similarity() {
+        let sim = cosine_similarity(&constant(1.0), &constant(-1.0));
+        assert!((sim + 1.0).abs() < 1e-4, "got {sim}");
+    }
+
+    #[test]
+    fn embedding_serializes_as_512_element_sequence() {
+        let v = serde_json::to_value(constant(0.25)).unwrap();
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 512);
+        assert_eq!(arr[0], serde_json::json!(0.25));
+    }
+}

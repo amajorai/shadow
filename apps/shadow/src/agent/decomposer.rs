@@ -190,3 +190,113 @@ impl TaskDecomposer {
         phases
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_action_is_single_executor_task() {
+        let r = TaskDecomposer::decompose("click Send", Intent::UiAction);
+        assert_eq!(r.sub_tasks.len(), 1);
+        assert_eq!(r.sub_tasks[0].role, AgentRole::Executor);
+        assert_eq!(r.sub_tasks[0].instruction, "click Send");
+        assert!(!r.sub_tasks[0].parallelizable);
+        assert!(r.sub_tasks[0].dependencies.is_empty());
+        assert_eq!(r.estimated_timeout_s, 60);
+        assert_eq!(r.intent, Intent::UiAction);
+    }
+
+    #[test]
+    fn memory_search_has_dependent_synthesis_step() {
+        let r = TaskDecomposer::decompose("what did I read", Intent::MemorySearch);
+        assert_eq!(r.sub_tasks.len(), 2);
+        assert_eq!(r.sub_tasks[0].role, AgentRole::MemoryManager);
+        assert!(r.sub_tasks[0].dependencies.is_empty());
+        assert_eq!(r.sub_tasks[1].role, AgentRole::General);
+        assert_eq!(r.sub_tasks[1].dependencies, vec!["memory_search".to_string()]);
+        // Timeout is the sum of both sub-task timeouts.
+        assert_eq!(r.estimated_timeout_s, 30);
+    }
+
+    #[test]
+    fn procedure_learning_observes_then_synthesizes() {
+        let r = TaskDecomposer::decompose("learn how I file expenses", Intent::ProcedureLearning);
+        assert_eq!(r.sub_tasks.len(), 2);
+        assert_eq!(r.sub_tasks[0].role, AgentRole::Observer);
+        assert_eq!(r.sub_tasks[1].role, AgentRole::LearningEngine);
+        assert_eq!(r.sub_tasks[1].dependencies, vec!["observe".to_string()]);
+        assert_eq!(r.estimated_timeout_s, 330);
+    }
+
+    #[test]
+    fn directive_creation_is_short_single_task() {
+        let r = TaskDecomposer::decompose("remind me to stretch", Intent::DirectiveCreation);
+        assert_eq!(r.sub_tasks.len(), 1);
+        assert_eq!(r.sub_tasks[0].role, AgentRole::MemoryManager);
+        assert_eq!(r.estimated_timeout_s, 5);
+    }
+
+    #[test]
+    fn complex_reasoning_gathers_then_analyzes() {
+        let r = TaskDecomposer::decompose("compare X and Y", Intent::ComplexReasoning);
+        assert_eq!(r.sub_tasks.len(), 2);
+        assert_eq!(r.sub_tasks[1].dependencies, vec!["gather".to_string()]);
+        assert_eq!(r.estimated_timeout_s, 50);
+    }
+
+    #[test]
+    fn simple_question_and_replay_and_ambiguous_are_single_tasks() {
+        for intent in [
+            Intent::SimpleQuestion,
+            Intent::ProcedureReplay,
+            Intent::Ambiguous,
+        ] {
+            let r = TaskDecomposer::decompose("task", intent.clone());
+            assert_eq!(r.sub_tasks.len(), 1, "{intent:?} should be one task");
+            assert!(r.sub_tasks[0].dependencies.is_empty());
+        }
+    }
+
+    #[test]
+    fn group_into_phases_puts_independent_tasks_in_phase_zero() {
+        let tasks = TaskDecomposer::decompose("q", Intent::MemorySearch).sub_tasks;
+        let phases = TaskDecomposer::group_into_phases(&tasks);
+        // First task has no deps → phase 0; second depends on "memory_search"
+        // which the first instruction contains → phase 1.
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0].len(), 1);
+        assert_eq!(phases[1].len(), 1);
+        assert_eq!(phases[0][0].role, AgentRole::MemoryManager);
+        assert_eq!(phases[1][0].role, AgentRole::General);
+    }
+
+    #[test]
+    fn group_into_phases_single_phase_when_all_independent() {
+        let tasks = vec![
+            SubTask {
+                role: AgentRole::General,
+                instruction: "a".to_string(),
+                parallelizable: true,
+                timeout_s: 5,
+                dependencies: vec![],
+            },
+            SubTask {
+                role: AgentRole::Observer,
+                instruction: "b".to_string(),
+                parallelizable: true,
+                timeout_s: 5,
+                dependencies: vec![],
+            },
+        ];
+        let phases = TaskDecomposer::group_into_phases(&tasks);
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0].len(), 2);
+    }
+
+    #[test]
+    fn group_into_phases_empty_input_yields_no_phases() {
+        let phases = TaskDecomposer::group_into_phases(&[]);
+        assert!(phases.is_empty());
+    }
+}

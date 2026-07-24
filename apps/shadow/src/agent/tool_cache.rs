@@ -85,3 +85,84 @@ fn cache_key(tool: &str, args: &serde_json::Value) -> String {
     let hash = hasher.finalize();
     format!("{:x}", hash)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn set_then_get_round_trips_for_cacheable_tool() {
+        let mut cache = ToolResultCache::new();
+        let args = json!({"category": "prefs"});
+        cache.set("get_knowledge", &args, json!({"facts": [1, 2]}));
+        let got = cache.get("get_knowledge", &args);
+        assert_eq!(got, Some(json!({"facts": [1, 2]})));
+    }
+
+    #[test]
+    fn get_returns_none_for_different_args() {
+        let mut cache = ToolResultCache::new();
+        cache.set("get_knowledge", &json!({"q": "a"}), json!("A"));
+        assert_eq!(cache.get("get_knowledge", &json!({"q": "b"})), None);
+    }
+
+    #[test]
+    fn never_cached_tools_are_not_stored() {
+        let mut cache = ToolResultCache::new();
+        let args = json!({});
+        cache.set("capture_live_screenshot", &args, json!("img"));
+        cache.set("ax_screenshot", &args, json!("img"));
+        assert_eq!(cache.get("capture_live_screenshot", &args), None);
+        assert_eq!(cache.get("ax_screenshot", &args), None);
+    }
+
+    #[test]
+    fn clear_empties_the_cache() {
+        let mut cache = ToolResultCache::new();
+        cache.set("get_directives", &json!({}), json!([]));
+        assert!(cache.get("get_directives", &json!({})).is_some());
+        cache.clear();
+        assert!(cache.get("get_directives", &json!({})).is_none());
+    }
+
+    #[test]
+    fn evict_expired_removes_stale_entries() {
+        let mut cache = ToolResultCache::new();
+        // Manually insert an already-expired entry.
+        let key = cache_key("get_knowledge", &json!({}));
+        cache.entries.insert(
+            key,
+            CacheEntry {
+                value: json!("stale"),
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        cache.evict_expired();
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn ttl_for_tool_matches_policy() {
+        assert_eq!(ttl_for_tool("capture_live_screenshot"), Duration::ZERO);
+        assert_eq!(ttl_for_tool("ax_screenshot"), Duration::ZERO);
+        assert_eq!(ttl_for_tool("ax_tree_query"), Duration::from_secs(15));
+        assert_eq!(ttl_for_tool("get_knowledge"), Duration::from_secs(300));
+        assert_eq!(ttl_for_tool("search_hybrid"), Duration::from_secs(60));
+        // Unknown tools fall back to the 30s default.
+        assert_eq!(ttl_for_tool("some_new_tool"), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn cache_key_is_deterministic_and_order_sensitive_to_tool() {
+        let args = json!({"a": 1});
+        assert_eq!(cache_key("t", &args), cache_key("t", &args));
+        assert_ne!(cache_key("t1", &args), cache_key("t2", &args));
+    }
+
+    #[test]
+    fn default_is_equivalent_to_new() {
+        let mut cache = ToolResultCache::default();
+        assert!(cache.get("get_knowledge", &json!({})).is_none());
+    }
+}

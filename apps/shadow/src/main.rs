@@ -417,3 +417,69 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn start_defaults_to_port_3030() {
+        let cli = Cli::try_parse_from(["shadow", "start"]).expect("parse start");
+        match cli.command {
+            Commands::Start { port, .. } => assert_eq!(port, 3030),
+            other => panic!("expected Start, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn start_accepts_explicit_port_short_and_long() {
+        for args in [
+            ["shadow", "start", "--port", "9999"],
+            ["shadow", "start", "-p", "9999"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parse");
+            match cli.command {
+                Commands::Start { port, .. } => assert_eq!(port, 9999),
+                _ => panic!("expected Start"),
+            }
+        }
+    }
+
+    #[test]
+    fn start_rejects_non_numeric_port() {
+        assert!(Cli::try_parse_from(["shadow", "start", "--port", "abc"]).is_err());
+    }
+
+    #[test]
+    fn search_requires_query() {
+        assert!(Cli::try_parse_from(["shadow", "search"]).is_err());
+        let cli = Cli::try_parse_from(["shadow", "search", "--query", "invoice"]).expect("parse");
+        match cli.command {
+            Commands::Search { query } => assert_eq!(query, "invoice"),
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn stop_and_status_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["shadow", "stop"]).unwrap().command,
+            Commands::Stop
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["shadow", "status"]).unwrap().command,
+            Commands::Status
+        ));
+    }
+
+    #[test]
+    fn missing_subcommand_is_an_error() {
+        assert!(Cli::try_parse_from(["shadow"]).is_err());
+    }
+
+    #[test]
+    fn unknown_subcommand_is_an_error() {
+        assert!(Cli::try_parse_from(["shadow", "frobnicate"]).is_err());
+    }
+}

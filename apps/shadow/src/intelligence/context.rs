@@ -356,3 +356,113 @@ impl Default for ContextSynthesizer {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("shadow-context-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn record(id: &str, app: &str, start_us: u64, end_us: u64) -> EpisodeRecord {
+        EpisodeRecord {
+            id: id.to_string(),
+            start_us,
+            end_us,
+            app_name: app.to_string(),
+            window_title: "title".to_string(),
+            actions: vec![],
+            summary: "summary".to_string(),
+            bundle_id: None,
+        }
+    }
+
+    #[test]
+    fn fallback_summary_formats_duration_in_seconds() {
+        assert_eq!(fallback_summary("Mail", 0, 5_000_000), "Used Mail for 5s");
+    }
+
+    #[test]
+    fn fallback_summary_from_actions_counts_actions() {
+        let actions = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            fallback_summary_from_actions("Slack", &actions),
+            "Used Slack (2 actions)"
+        );
+    }
+
+    #[test]
+    fn episode_store_save_and_load_recent_orders_by_start_desc() {
+        let path = temp_db();
+        let store = EpisodeStore::new(&path).unwrap();
+        store.save(&record("old", "Mail", 100, 200)).unwrap();
+        store.save(&record("new", "Slack", 300, 400)).unwrap();
+
+        let recent = store.load_recent(10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].id, "new", "most recent start_us first");
+        assert_eq!(recent[1].id, "old");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn episode_store_load_recent_respects_limit() {
+        let path = temp_db();
+        let store = EpisodeStore::new(&path).unwrap();
+        for i in 0..5u64 {
+            store
+                .save(&record(&format!("e{i}"), "App", i * 10, i * 10 + 5))
+                .unwrap();
+        }
+        assert_eq!(store.load_recent(2).unwrap().len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn episode_store_save_is_upsert_by_id() {
+        let path = temp_db();
+        let store = EpisodeStore::new(&path).unwrap();
+        store.save(&record("dup", "Mail", 1, 2)).unwrap();
+        store.save(&record("dup", "Slack", 3, 4)).unwrap();
+        let recent = store.load_recent(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].app_name, "Slack");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn last_synth_timestamp_defaults_zero_then_round_trips() {
+        let path = temp_db();
+        let store = EpisodeStore::new(&path).unwrap();
+        assert_eq!(store.last_synth_timestamp().unwrap(), 0);
+        store.set_last_synth_timestamp(123_456).unwrap();
+        assert_eq!(store.last_synth_timestamp().unwrap(), 123_456);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn get_recent_episodes_returns_from_store_without_timeline() {
+        let path = temp_db();
+        let store = Arc::new(Mutex::new(EpisodeStore::new(&path).unwrap()));
+        store.lock().unwrap().save(&record("e1", "Mail", 10, 20)).unwrap();
+
+        let synth = ContextSynthesizer {
+            episode_store: Some(store),
+            orchestrator: None,
+        };
+        let episodes = synth.get_recent_episodes(5).unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].id, "e1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn synthesize_episode_without_orchestrator_uses_fallback() {
+        let synth = ContextSynthesizer::new();
+        let out = synth
+            .synthesize_episode_llm("Mail", &["opened inbox".to_string()])
+            .await;
+        assert_eq!(out, "Used Mail (1 actions)");
+    }
+}

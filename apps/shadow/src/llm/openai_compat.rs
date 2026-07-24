@@ -326,3 +326,66 @@ impl LlmProvider for OpenAICompatClient {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{LlmMessage, LlmRequest, ToolDefinition};
+
+    fn client() -> OpenAICompatClient {
+        OpenAICompatClient::new(
+            "http://example.invalid/v1/".to_string(),
+            "test-model".to_string(),
+            "sk-test".to_string(),
+        )
+    }
+
+    #[test]
+    fn new_trims_trailing_slash_from_base_url() {
+        let c = client();
+        assert_eq!(c.base_url, "http://example.invalid/v1");
+        assert_eq!(c.model, "test-model");
+    }
+
+    #[test]
+    fn build_body_maps_messages_and_params() {
+        let c = client();
+        let req = LlmRequest {
+            messages: vec![LlmMessage::system("sys"), LlmMessage::user("hi")],
+            temperature: 0.25,
+            max_tokens: 128,
+            ..Default::default()
+        };
+        let body = c.build_body(&req, false);
+        assert_eq!(body["model"], serde_json::json!("test-model"));
+        assert_eq!(body["stream"], serde_json::json!(false));
+        assert_eq!(body["max_tokens"], serde_json::json!(128));
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], serde_json::json!("system"));
+        assert_eq!(msgs[0]["content"], serde_json::json!("sys"));
+        // No tools key when the request carries none.
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn build_body_includes_tools_when_present() {
+        let c = client();
+        let req = LlmRequest {
+            messages: vec![LlmMessage::user("go")],
+            tools: vec![ToolDefinition {
+                name: "ax_click".to_string(),
+                description: "click".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            ..Default::default()
+        };
+        let body = c.build_body(&req, true);
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(body["tool_choice"], serde_json::json!("auto"));
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], serde_json::json!("function"));
+        assert_eq!(tools[0]["function"]["name"], serde_json::json!("ax_click"));
+    }
+}

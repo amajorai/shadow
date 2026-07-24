@@ -98,3 +98,109 @@ fn score_procedure(
 
     score
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mimicry::procedure::ProcedureStore;
+
+    fn make(id: &str, name: &str, app: &str, desc: &str) -> ProcedureTemplate {
+        ProcedureTemplate {
+            id: id.to_string(),
+            name: name.to_string(),
+            app_name: app.to_string(),
+            description: desc.to_string(),
+            steps: vec![],
+            preconditions: vec![],
+            success_count: 0,
+            failure_count: 0,
+            last_used: 0,
+            created_at: 0,
+        }
+    }
+
+    fn temp_store() -> (ProcedureStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("shadow-match-{}", uuid::Uuid::new_v4()));
+        let db = dir.join("procedures.db");
+        (ProcedureStore::new(&db).expect("store"), dir)
+    }
+
+    #[test]
+    fn score_procedure_exact_app_match() {
+        let p = make("x", "Task", "Slack", "");
+        let s = score_procedure(&p, "slack", &[], &[]);
+        assert!((s - 0.8).abs() < 1e-5, "s={s}");
+    }
+
+    #[test]
+    fn score_procedure_recent_apps_fallback() {
+        let p = make("x", "Task", "Slack", "");
+        let recent = vec!["Slack".to_string(), "Chrome".to_string()];
+        // Current app differs, but Slack is in recent_apps → 0.6, not 0.8.
+        let s = score_procedure(&p, "notepad", &[], &recent);
+        assert!((s - 0.6).abs() < 1e-5, "s={s}");
+    }
+
+    #[test]
+    fn score_procedure_title_keyword_overlap() {
+        // No app match; title words (>3 chars) overlap procedure text.
+        let p = make("x", "Compose", "Mail", "write email");
+        let title_words = ["compose", "message"]; // only "compose" is in proc text
+        let s = score_procedure(&p, "other", &title_words, &[]);
+        // 0.4 * 1/2.
+        assert!((s - 0.2).abs() < 1e-5, "s={s}");
+    }
+
+    #[test]
+    fn score_procedure_empty_app_name_does_not_match_empty_app() {
+        // Guard: a procedure with empty app_name must not score on an empty app arg.
+        let p = make("x", "Task", "", "");
+        let s = score_procedure(&p, "", &[], &[]);
+        assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn match_context_sorts_and_filters_zero_scores() {
+        let (store, dir) = temp_store();
+        store
+            .save(&make("a", "Compose", "Mail", "write email"))
+            .unwrap();
+        store
+            .save(&make("b", "Resize", "Photos", "crop image"))
+            .unwrap();
+
+        let matches = ProcedureMatcher::match_context("Mail", "compose window", &[], &store);
+        // Only the Mail procedure scores (app match + maybe title); Photos scores 0.
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0.id, "a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn match_context_caps_results_at_five() {
+        let (store, dir) = temp_store();
+        for i in 0..8 {
+            store
+                .save(&make(&format!("p{i}"), "Task", "Mail", "d"))
+                .unwrap();
+        }
+        let matches = ProcedureMatcher::match_context("Mail", "", &[], &store);
+        assert_eq!(matches.len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_for_prompt_empty_when_no_matches() {
+        assert_eq!(ProcedureMatcher::format_for_prompt(&[]), "");
+    }
+
+    #[test]
+    fn format_for_prompt_renders_name_app_and_score() {
+        let matches = vec![(make("x", "Compose", "Mail", "write email"), 0.8)];
+        let out = ProcedureMatcher::format_for_prompt(&matches);
+        assert!(out.contains("Relevant known procedures"));
+        assert!(out.contains("Compose"));
+        assert!(out.contains("app=Mail"));
+        assert!(out.contains("0.80"));
+    }
+}

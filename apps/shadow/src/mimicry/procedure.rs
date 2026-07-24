@@ -169,3 +169,169 @@ fn row_to_procedure(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcedureTempla
         created_at: row.get::<_, i64>(9)? as u64,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mimicry::types::{ProcedureStep, StepFailureAction};
+
+    fn temp_store() -> (ProcedureStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("shadow-proc-{}", uuid::Uuid::new_v4()));
+        let db = dir.join("procedures.db");
+        (ProcedureStore::new(&db).expect("open store"), dir)
+    }
+
+    fn make(id: &str, name: &str, app: &str, desc: &str) -> ProcedureTemplate {
+        ProcedureTemplate {
+            id: id.to_string(),
+            name: name.to_string(),
+            app_name: app.to_string(),
+            description: desc.to_string(),
+            steps: vec![ProcedureStep {
+                step_number: 1,
+                description: "step".to_string(),
+                tool_name: "ax_click".to_string(),
+                tool_args: serde_json::json!({"query": "Send"}),
+                verification: None,
+                on_failure: StepFailureAction::Abort,
+            }],
+            preconditions: vec!["app running".to_string()],
+            success_count: 0,
+            failure_count: 0,
+            last_used: 0,
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn save_and_get_round_trips_steps_and_preconditions() {
+        let (store, dir) = temp_store();
+        store
+            .save(&make("p1", "Compose Email", "Mail", "write a new email"))
+            .unwrap();
+        let got = store.get("p1").unwrap().expect("p1");
+        assert_eq!(got.name, "Compose Email");
+        assert_eq!(got.steps.len(), 1);
+        assert_eq!(got.steps[0].tool_name, "ax_click");
+        assert_eq!(got.preconditions, vec!["app running".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_missing_returns_none() {
+        let (store, dir) = temp_store();
+        assert!(store.get("does-not-exist").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_replaces_on_duplicate_id() {
+        let (store, dir) = temp_store();
+        store.save(&make("dup", "First", "App", "d")).unwrap();
+        store.save(&make("dup", "Second", "App", "d")).unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.get("dup").unwrap().unwrap().name, "Second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_orders_by_success_count_desc() {
+        let (store, dir) = temp_store();
+        let mut low = make("low", "Low", "A", "d");
+        low.success_count = 1;
+        let mut high = make("high", "High", "A", "d");
+        high.success_count = 9;
+        store.save(&low).unwrap();
+        store.save(&high).unwrap();
+        let list = store.list().unwrap();
+        assert_eq!(list[0].id, "high");
+        assert_eq!(list[1].id, "low");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_success_and_failure_update_counts() {
+        let (store, dir) = temp_store();
+        store.save(&make("p", "P", "A", "d")).unwrap();
+        store.record_success("p").unwrap();
+        store.record_success("p").unwrap();
+        store.record_failure("p").unwrap();
+        let got = store.get("p").unwrap().unwrap();
+        assert_eq!(got.success_count, 2);
+        assert_eq!(got.failure_count, 1);
+        assert!(got.last_used > 0, "record_success stamps last_used");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_removes_the_row() {
+        let (store, dir) = temp_store();
+        store.save(&make("p", "P", "A", "d")).unwrap();
+        store.delete("p").unwrap();
+        assert!(store.get("p").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_by_name_is_case_insensitive_substring() {
+        let (store, dir) = temp_store();
+        store
+            .save(&make("p", "Compose Email", "Mail", "start a draft"))
+            .unwrap();
+        assert!(store.find_by_name("compose").unwrap().is_some());
+        assert!(store.find_by_name("EMAIL").unwrap().is_some());
+        // Matches description too.
+        assert!(store.find_by_name("draft").unwrap().is_some());
+        assert!(store.find_by_name("nonexistent").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_similar_matches_keywords_over_three_chars() {
+        let (store, dir) = temp_store();
+        store
+            .save(&make(
+                "p1",
+                "Send Report",
+                "Mail",
+                "email the weekly report",
+            ))
+            .unwrap();
+        store
+            .save(&make("p2", "Resize Photo", "Photos", "crop and resize"))
+            .unwrap();
+
+        let hits = store.find_similar("send report", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "p1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_similar_ignores_short_words_and_returns_empty() {
+        let (store, dir) = temp_store();
+        store.save(&make("p1", "Send Report", "Mail", "d")).unwrap();
+        // All words <= 3 chars → no keywords → empty result.
+        let hits = store.find_similar("go to it", 10).unwrap();
+        assert!(hits.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_similar_respects_limit() {
+        let (store, dir) = temp_store();
+        for i in 0..4 {
+            store
+                .save(&make(
+                    &format!("p{i}"),
+                    "Report Builder",
+                    "App",
+                    "generate report",
+                ))
+                .unwrap();
+        }
+        let hits = store.find_similar("report", 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

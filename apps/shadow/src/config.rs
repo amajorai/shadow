@@ -127,3 +127,60 @@ impl Default for Config {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Build a Config without touching process env (Config::new reads env vars).
+    fn fixture(data_dir: &str) -> Config {
+        Config {
+            data_dir: PathBuf::from(data_dir),
+            port: 3030,
+            capture: CaptureConfig::default(),
+            llm: LlmConfig {
+                base_url: "http://localhost:11434/v1".to_string(),
+                model: "qwen2.5:7b".to_string(),
+                api_key: String::new(),
+            },
+            retention: RetentionConfig::default(),
+        }
+    }
+
+    #[test]
+    fn capture_config_default_enables_all_sources() {
+        let c = CaptureConfig::default();
+        assert!(c.screen && c.input && c.audio);
+    }
+
+    #[test]
+    fn retention_config_defaults() {
+        let r = RetentionConfig::default();
+        assert_eq!(r.hot_days, 7);
+        assert_eq!(r.warm_days, 23);
+        assert_eq!(r.max_storage_gb, 50);
+    }
+
+    #[test]
+    fn memory_db_path_is_under_indices() {
+        let cfg = fixture("/var/shadow");
+        assert_eq!(
+            cfg.memory_db_path(),
+            PathBuf::from("/var/shadow")
+                .join("indices")
+                .join("memory.db")
+        );
+    }
+
+    #[test]
+    fn config_serde_round_trips() {
+        let cfg = fixture("/data");
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.port, 3030);
+        assert_eq!(back.data_dir, PathBuf::from("/data"));
+        assert_eq!(back.llm.model, "qwen2.5:7b");
+        assert_eq!(back.retention.warm_days, 23);
+        assert!(back.capture.audio);
+    }
+}

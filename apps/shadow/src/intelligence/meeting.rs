@@ -359,3 +359,144 @@ impl SummaryStore {
         Ok(rows.next().and_then(|r| r.ok()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn temp_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("shadow-summary-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn sample_summary(id: &str, hash: &str) -> MeetingSummary {
+        MeetingSummary {
+            id: id.to_string(),
+            title: "Standup".to_string(),
+            summary: "We synced.".to_string(),
+            key_points: vec!["shipped X".to_string()],
+            decisions: vec!["use Y".to_string()],
+            action_items: vec![ActionItem {
+                description: "follow up".to_string(),
+                owner: Some("alice".to_string()),
+                due_date: None,
+            }],
+            open_questions: vec![],
+            highlights: vec!["good demo".to_string()],
+            participants: vec!["alice".to_string(), "bob".to_string()],
+            start_us: 100,
+            end_us: 200,
+            app_name: "Zoom".to_string(),
+            created_at: 1,
+            transcript_hash: hash.to_string(),
+        }
+    }
+
+    #[test]
+    fn json_array_of_strings_filters_non_strings() {
+        let v = json!(["a", 1, "b", null, "c"]);
+        assert_eq!(json_array_of_strings(&v), vec!["a", "b", "c"]);
+        // Non-array yields empty.
+        assert!(json_array_of_strings(&json!("nope")).is_empty());
+    }
+
+    #[test]
+    fn parse_action_items_reads_fields_and_skips_incomplete() {
+        let v = json!([
+            {"description": "do thing", "owner": "bob", "due_date": "2026-08-01"},
+            {"owner": "no description"}
+        ]);
+        let items = parse_action_items(&v);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].description, "do thing");
+        assert_eq!(items[0].owner.as_deref(), Some("bob"));
+        assert_eq!(items[0].due_date.as_deref(), Some("2026-08-01"));
+    }
+
+    #[test]
+    fn parse_action_items_owner_and_due_optional() {
+        let v = json!([{"description": "solo"}]);
+        let items = parse_action_items(&v);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].owner.is_none());
+        assert!(items[0].due_date.is_none());
+    }
+
+    #[test]
+    fn extract_json_object_balances_braces() {
+        assert_eq!(
+            extract_json_object("pre {\"a\":{\"b\":1}} post").unwrap(),
+            "{\"a\":{\"b\":1}}"
+        );
+        assert_eq!(extract_json_object("no object"), None);
+        assert_eq!(extract_json_object("{unterminated"), None);
+    }
+
+    #[test]
+    fn summary_store_store_and_get_round_trips() {
+        let path = temp_db();
+        let store = SummaryStore::new(&path).unwrap();
+        store.store(&sample_summary("m1", "hash1")).unwrap();
+
+        let got = store.get("m1").unwrap().expect("stored summary");
+        assert_eq!(got.title, "Standup");
+        assert_eq!(got.key_points, vec!["shipped X".to_string()]);
+        assert_eq!(got.action_items.len(), 1);
+        assert_eq!(got.action_items[0].owner.as_deref(), Some("alice"));
+        assert_eq!(got.participants.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn summary_store_get_missing_is_none() {
+        let path = temp_db();
+        let store = SummaryStore::new(&path).unwrap();
+        assert!(store.get("absent").unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn summary_store_list_orders_by_created_at_desc() {
+        let path = temp_db();
+        let store = SummaryStore::new(&path).unwrap();
+        let mut older = sample_summary("old", "h_old");
+        older.created_at = 10;
+        let mut newer = sample_summary("new", "h_new");
+        newer.created_at = 20;
+        store.store(&older).unwrap();
+        store.store(&newer).unwrap();
+
+        let list = store.list(10).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "new");
+        assert_eq!(list[1].id, "old");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn summary_store_dedups_on_transcript_hash() {
+        let path = temp_db();
+        let store = SummaryStore::new(&path).unwrap();
+        store.store(&sample_summary("first", "samehash")).unwrap();
+        // Same transcript_hash (UNIQUE) → INSERT OR IGNORE keeps the first.
+        store.store(&sample_summary("second", "samehash")).unwrap();
+        let list = store.list(10).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "first");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn meeting_window_and_summary_serialize() {
+        let w = MeetingWindow {
+            start_us: 1,
+            end_us: 2,
+            app_name: "Meet".to_string(),
+            confidence: 0.85,
+        };
+        let v = serde_json::to_value(&w).unwrap();
+        assert!((v["confidence"].as_f64().unwrap() - 0.85).abs() < 1e-4);
+        assert_eq!(v["app_name"], json!("Meet"));
+        assert_eq!(v["start_us"], json!(1));
+    }
+}

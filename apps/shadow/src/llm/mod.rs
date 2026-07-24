@@ -140,3 +140,65 @@ pub trait LlmProvider: Send + Sync {
         on_token: &mut (dyn FnMut(String) + Send),
     ) -> anyhow::Result<LlmResponse>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_constructors_set_role_and_text() {
+        assert_eq!(LlmMessage::system("s").role, "system");
+        assert_eq!(LlmMessage::user("u").role, "user");
+        assert_eq!(LlmMessage::assistant("a").role, "assistant");
+        assert_eq!(LlmMessage::user("hello").content.as_str(), "hello");
+    }
+
+    #[test]
+    fn message_content_as_str_is_empty_for_parts() {
+        let parts = MessageContent::Parts(vec![ContentPart {
+            part_type: "text".to_string(),
+            text: Some("ignored".to_string()),
+        }]);
+        assert_eq!(parts.as_str(), "");
+        assert_eq!(MessageContent::text("x").as_str(), "x");
+    }
+
+    #[test]
+    fn tool_result_embeds_id_and_json_encoded_content() {
+        let msg = LlmMessage::tool_result("call_1", "the result");
+        assert_eq!(msg.role, "tool");
+        let s = msg.content.as_str();
+        assert!(s.contains("\"tool_call_id\":\"call_1\""));
+        assert!(s.contains("\"the result\""));
+    }
+
+    #[test]
+    fn text_content_serializes_untagged_as_string() {
+        let msg = LlmMessage::user("hi");
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["role"], serde_json::json!("user"));
+        // Untagged MessageContent::Text serializes as a bare string.
+        assert_eq!(v["content"], serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn llm_request_defaults() {
+        let req = LlmRequest::default();
+        assert!(req.messages.is_empty());
+        assert!(req.tools.is_empty());
+        assert!((req.temperature - 0.7).abs() < 1e-6);
+        assert_eq!(req.max_tokens, 4096);
+        assert!(!req.stream);
+    }
+
+    #[test]
+    fn content_part_skips_none_text_on_serialize() {
+        let part = ContentPart {
+            part_type: "image".to_string(),
+            text: None,
+        };
+        let v = serde_json::to_value(&part).unwrap();
+        assert_eq!(v["type"], serde_json::json!("image"));
+        assert!(v.get("text").is_none(), "None text must be skipped");
+    }
+}

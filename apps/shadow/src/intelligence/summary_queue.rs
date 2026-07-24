@@ -175,3 +175,92 @@ fn input_hash(start_us: u64, end_us: u64, app_name: &str) -> String {
     hasher.update(app_name.as_bytes());
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(hash: &str) -> SummaryJob {
+        SummaryJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            input_hash: hash.to_string(),
+            start_us: 0,
+            end_us: 1,
+            app_name: "Zoom".to_string(),
+        }
+    }
+
+    #[test]
+    fn new_queue_is_empty() {
+        let q = SummaryQueue::new();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn enqueue_then_pop_is_fifo() {
+        let mut q = SummaryQueue::new();
+        q.enqueue(job("a")).unwrap();
+        q.enqueue(job("b")).unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pop().unwrap().input_hash, "a");
+        assert_eq!(q.pop().unwrap().input_hash, "b");
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn enqueue_coalesces_duplicate_hashes() {
+        let mut q = SummaryQueue::new();
+        q.enqueue(job("dup")).unwrap();
+        q.enqueue(job("dup")).unwrap();
+        assert_eq!(q.len(), 1, "same input_hash must not enqueue twice");
+    }
+
+    #[test]
+    fn enqueue_rejects_when_full() {
+        let mut q = SummaryQueue::new();
+        q.enqueue(job("a")).unwrap();
+        q.enqueue(job("b")).unwrap();
+        q.enqueue(job("c")).unwrap();
+        let err = q.enqueue(job("d"));
+        assert!(matches!(err, Err(QueueError::Full)));
+        assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn queue_error_displays_message() {
+        assert_eq!(QueueError::Full.to_string(), "queue full (max pending reached)");
+    }
+
+    #[test]
+    fn input_hash_is_deterministic_and_16_hex() {
+        let a = input_hash(1, 2, "Zoom");
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, input_hash(1, 2, "Zoom"));
+        assert_ne!(a, input_hash(1, 2, "Teams"));
+        assert_ne!(a, input_hash(9, 2, "Zoom"));
+    }
+
+    #[test]
+    fn coordinator_result_serializes_with_status_tag() {
+        let v = serde_json::to_value(CoordinatorResult::Enqueued {
+            job_id: "j1".to_string(),
+        })
+        .unwrap();
+        assert_eq!(v["status"], serde_json::json!("enqueued"));
+        assert_eq!(v["job_id"], serde_json::json!("j1"));
+
+        let no_meeting = serde_json::to_value(CoordinatorResult::NoMeetingFound).unwrap();
+        assert_eq!(no_meeting["status"], serde_json::json!("no_meeting_found"));
+
+        let unavailable = serde_json::to_value(CoordinatorResult::Unavailable).unwrap();
+        assert_eq!(unavailable["status"], serde_json::json!("unavailable"));
+    }
+
+    #[test]
+    fn default_queue_matches_new() {
+        let q = SummaryQueue::default();
+        assert!(q.is_empty());
+    }
+}

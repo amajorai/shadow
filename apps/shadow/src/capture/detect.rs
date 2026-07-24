@@ -134,8 +134,19 @@ pub fn microphone_in_use() -> Option<MicUser> {
 /// its (user-editable) meeting-app list; this just avoids reporting every process.
 #[cfg(target_os = "macos")]
 const MAC_MEETING_PROCS: &[&str] = &[
-    "zoom.us", "zoom", "Microsoft Teams", "Teams", "Webex", "Google Chrome Helper",
-    "Slack", "Discord", "FaceTime", "Skype", "GoToMeeting", "Around", "Whereby",
+    "zoom.us",
+    "zoom",
+    "Microsoft Teams",
+    "Teams",
+    "Webex",
+    "Google Chrome Helper",
+    "Slack",
+    "Discord",
+    "FaceTime",
+    "Skype",
+    "GoToMeeting",
+    "Around",
+    "Whereby",
 ];
 
 /// macOS: no public per-process mic API, so scan running processes for a known

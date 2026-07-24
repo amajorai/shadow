@@ -160,9 +160,7 @@ pub fn start(meeting_id: String, ingest_url: String) -> anyhow::Result<()> {
             // Emit every ready chunk; force-flush the tail when the meeting stops.
             while let Some(chunk) = segmenter.try_cut(!running_now) {
                 match encode_wav_16k_stereo(&chunk.stereo) {
-                    Ok(wav) => {
-                        upload_chunk(&client, &ingest_url, wav, &mid, chunk.offset_ms).await
-                    }
+                    Ok(wav) => upload_chunk(&client, &ingest_url, wav, &mid, chunk.offset_ms).await,
                     Err(e) => tracing::warn!("meeting recorder: WAV encode failed: {e}"),
                 }
             }

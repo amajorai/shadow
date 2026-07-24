@@ -181,3 +181,115 @@ fn heuristic_extract(episodes: &[EpisodeRecord]) -> Vec<ExtractedFact> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn episode(app: &str, end_us: u64) -> EpisodeRecord {
+        EpisodeRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            start_us: 0,
+            end_us,
+            app_name: app.to_string(),
+            window_title: String::new(),
+            actions: vec![],
+            summary: "did stuff".to_string(),
+            bundle_id: None,
+        }
+    }
+
+    #[test]
+    fn stable_id_is_deterministic_16_hex_and_content_sensitive() {
+        let a = stable_id("habit", "uses Slack");
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, stable_id("habit", "uses Slack"));
+        assert_ne!(a, stable_id("habit", "uses Teams"));
+        assert_ne!(a, stable_id("skill", "uses Slack"));
+    }
+
+    #[test]
+    fn parse_facts_extracts_valid_json_array() {
+        let content = "Here you go: [\
+            {\"category\":\"preference\",\"content\":\"likes dark mode\",\"confidence\":0.9},\
+            {\"category\":\"habit\",\"content\":\"checks email hourly\",\"confidence\":0.7}\
+        ] done";
+        let facts = parse_facts(content);
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].category, "preference");
+        assert_eq!(facts[0].content, "likes dark mode");
+        assert!((facts[0].confidence - 0.9).abs() < 1e-5);
+        // Deterministic id derived from category+content.
+        assert_eq!(facts[0].id, stable_id("preference", "likes dark mode"));
+    }
+
+    #[test]
+    fn parse_facts_defaults_missing_confidence_and_skips_empty_content() {
+        let content = "[\
+            {\"category\":\"habit\",\"content\":\"\",\"confidence\":0.9},\
+            {\"category\":\"skill\",\"content\":\"writes rust\"}\
+        ]";
+        let facts = parse_facts(content);
+        // Empty-content entry dropped; missing confidence defaults to 0.6.
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "writes rust");
+        assert!((facts[0].confidence - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parse_facts_returns_empty_on_garbage() {
+        assert!(parse_facts("no json here").is_empty());
+        assert!(parse_facts("[not valid json").is_empty());
+    }
+
+    #[test]
+    fn heuristic_extract_flags_apps_used_three_or_more_times() {
+        let episodes = vec![
+            episode("Slack", 1),
+            episode("Slack", 2),
+            episode("Slack", 3),
+            episode("Mail", 4), // only once → below threshold
+        ];
+        let facts = heuristic_extract(&episodes);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].category, "habit");
+        assert_eq!(facts[0].content, "Frequently uses Slack");
+        // 3/10 = 0.3 confidence.
+        assert!((facts[0].confidence - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn heuristic_extract_confidence_is_capped_at_point_eight() {
+        let episodes: Vec<EpisodeRecord> = (0..20).map(|i| episode("Chrome", i)).collect();
+        let facts = heuristic_extract(&episodes);
+        assert_eq!(facts.len(), 1);
+        assert!((facts[0].confidence - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn apply_facts_upserts_and_blends_confidence_on_repeat() {
+        let path =
+            std::env::temp_dir().join(format!("shadow-consolidate-{}", uuid::Uuid::new_v4()));
+        let store = SemanticMemoryStore::new(&path).unwrap();
+        let consolidator = SemanticConsolidator::new();
+
+        let fact = ExtractedFact {
+            id: stable_id("habit", "uses Slack"),
+            category: "habit".to_string(),
+            content: "uses Slack".to_string(),
+            confidence: 0.6,
+        };
+        let n = consolidator.apply_facts(std::slice::from_ref(&fact), &store).unwrap();
+        assert_eq!(n, 1);
+        let stored = store.list_by_category("habit").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!((stored[0].confidence - 0.6).abs() < 1e-5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn default_consolidator_constructs() {
+        let _ = SemanticConsolidator::default();
+    }
+}

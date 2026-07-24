@@ -107,7 +107,9 @@ pub async fn narrate_cards(
     match parse_narrated(&content) {
         Some(narrated) => merge(cards, narrated),
         None => {
-            tracing::warn!("journal narration returned unparseable output; using deterministic cards");
+            tracing::warn!(
+                "journal narration returned unparseable output; using deterministic cards"
+            );
             cards
         }
     }
@@ -232,5 +234,49 @@ mod tests {
     #[test]
     fn parse_rejects_non_array() {
         assert!(parse_narrated("no json here").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_reversed_brackets() {
+        assert!(parse_narrated("] then [").is_none());
+    }
+
+    #[test]
+    fn build_user_prompt_includes_ids_and_minutes() {
+        let cards = vec![base_card("journal-1-0")];
+        let prompt = build_user_prompt(&cards);
+        assert!(prompt.contains("journal-1-0"));
+        assert!(prompt.contains("\"minutes\": 1"));
+        assert!(prompt.contains("Cursor"));
+        assert!(prompt.contains("Return a JSON array"));
+    }
+
+    fn remote_orchestrator() -> Arc<LlmOrchestrator> {
+        // Non-local config → no Ollama probe spawned; generate() is never called
+        // on the early-return paths exercised below.
+        Arc::new(LlmOrchestrator::new(&crate::config::LlmConfig {
+            base_url: "http://example.invalid/v1".to_string(),
+            model: "m".to_string(),
+            api_key: "sk-test".to_string(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn narrate_cards_empty_returns_empty_without_calling_llm() {
+        let orch = remote_orchestrator();
+        let out = narrate_cards(&orch, vec![]).await;
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn narrate_cards_too_many_returns_unchanged() {
+        let orch = remote_orchestrator();
+        let cards: Vec<JournalCard> = (0..MAX_NARRATED_CARDS + 1)
+            .map(|i| base_card(&format!("c{i}")))
+            .collect();
+        let n = cards.len();
+        let out = narrate_cards(&orch, cards).await;
+        assert_eq!(out.len(), n, "over-cap input is returned untouched");
+        assert_eq!(out[0].title, "Cursor: main.rs");
     }
 }

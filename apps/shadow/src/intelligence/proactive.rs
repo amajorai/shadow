@@ -538,3 +538,207 @@ pub async fn run_proactive_heartbeat(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn suggestion(t: SuggestionType, confidence: f32) -> ProactiveSuggestion {
+        ProactiveSuggestion {
+            id: uuid::Uuid::new_v4().to_string(),
+            suggestion_type: t,
+            title: "title".to_string(),
+            body: "body".to_string(),
+            confidence,
+            disposition: SuggestionDisposition::InboxOnly,
+            created_at: 1,
+            metadata: serde_json::Value::Object(Default::default()),
+        }
+    }
+
+    #[test]
+    fn suggestion_type_as_str_covers_all_variants() {
+        assert_eq!(SuggestionType::Followup.as_str(), "followup");
+        assert_eq!(SuggestionType::MeetingPrep.as_str(), "meetingprep");
+        assert_eq!(SuggestionType::WorkloadPattern.as_str(), "workloadpattern");
+        assert_eq!(SuggestionType::Reminder.as_str(), "reminder");
+        assert_eq!(SuggestionType::ContextSwitch.as_str(), "contextswitch");
+        assert_eq!(SuggestionType::DailyDigest.as_str(), "dailydigest");
+    }
+
+    #[test]
+    fn score_suggestion_high_confidence_pushes_on_fast_tick() {
+        // DailyDigest interrupt cost 0.10 → effective 0.95 - 0.05 = 0.90 >= 0.72.
+        let s = suggestion(SuggestionType::DailyDigest, 0.95);
+        assert!(matches!(
+            score_suggestion(&s, TickType::Fast, None),
+            SuggestionDisposition::PushNow
+        ));
+    }
+
+    #[test]
+    fn score_suggestion_mid_confidence_is_inbox() {
+        // Followup cost 0.25 → effective 0.6 - 0.125 = 0.475; below 0.72 push, above 0.30 inbox.
+        let s = suggestion(SuggestionType::Followup, 0.6);
+        assert!(matches!(
+            score_suggestion(&s, TickType::Fast, None),
+            SuggestionDisposition::InboxOnly
+        ));
+    }
+
+    #[test]
+    fn score_suggestion_low_confidence_drops() {
+        let s = suggestion(SuggestionType::ContextSwitch, 0.2);
+        assert!(matches!(
+            score_suggestion(&s, TickType::Fast, None),
+            SuggestionDisposition::Drop
+        ));
+    }
+
+    #[test]
+    fn score_suggestion_deep_tick_has_lower_push_threshold() {
+        // Followup 0.6 → effective 0.475. Fast push threshold 0.72 → Inbox.
+        // Deep push threshold 0.55 → still Inbox (0.475 < 0.55). Use a value between.
+        let s = suggestion(SuggestionType::DailyDigest, 0.62);
+        // effective = 0.62 - 0.05 = 0.57. Fast(0.72) → Inbox; Deep(0.55) → Push.
+        assert!(matches!(
+            score_suggestion(&s, TickType::Fast, None),
+            SuggestionDisposition::InboxOnly
+        ));
+        assert!(matches!(
+            score_suggestion(&s, TickType::Deep, None),
+            SuggestionDisposition::PushNow
+        ));
+    }
+
+    #[test]
+    fn apply_policy_filters_dropped_and_sets_disposition() {
+        let raw = vec![
+            suggestion(SuggestionType::DailyDigest, 0.95), // push
+            suggestion(SuggestionType::ContextSwitch, 0.1), // drop
+        ];
+        let kept = apply_policy(raw, TickType::Fast, None);
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(kept[0].disposition, SuggestionDisposition::PushNow));
+    }
+
+    #[test]
+    fn parse_suggestions_maps_types_and_defaults() {
+        let content = "prefix [\
+            {\"type\":\"meeting_prep\",\"title\":\"Prep\",\"body\":\"b\",\"confidence\":0.8},\
+            {\"type\":\"unknown_kind\",\"title\":\"X\",\"body\":\"y\"}\
+        ] suffix";
+        let out = parse_suggestions(content);
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0].suggestion_type, SuggestionType::MeetingPrep));
+        assert!((out[0].confidence - 0.8).abs() < 1e-5);
+        // Unknown type falls back to Followup, missing confidence defaults 0.5.
+        assert!(matches!(out[1].suggestion_type, SuggestionType::Followup));
+        assert!((out[1].confidence - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parse_suggestions_skips_entries_missing_required_fields() {
+        // Missing "body" → dropped.
+        let content = "[{\"type\":\"followup\",\"title\":\"only title\"}]";
+        assert!(parse_suggestions(content).is_empty());
+    }
+
+    #[test]
+    fn parse_suggestions_empty_on_garbage() {
+        assert!(parse_suggestions("no array here").is_empty());
+    }
+
+    #[test]
+    fn extract_json_array_grabs_bracketed_span() {
+        assert_eq!(extract_json_array("x [1,2] y").unwrap(), "[1,2]");
+        assert_eq!(extract_json_array("none"), None);
+    }
+
+    #[test]
+    fn parse_suggestion_type_reads_debug_strings() {
+        assert!(matches!(parse_suggestion_type("MeetingPrep"), SuggestionType::MeetingPrep));
+        assert!(matches!(parse_suggestion_type("WorkloadPattern"), SuggestionType::WorkloadPattern));
+        assert!(matches!(parse_suggestion_type("Reminder"), SuggestionType::Reminder));
+        assert!(matches!(parse_suggestion_type("ContextSwitch"), SuggestionType::ContextSwitch));
+        assert!(matches!(parse_suggestion_type("DailyDigest"), SuggestionType::DailyDigest));
+        assert!(matches!(parse_suggestion_type("Followup"), SuggestionType::Followup));
+    }
+
+    #[test]
+    fn parse_disposition_reads_debug_strings() {
+        assert!(matches!(parse_disposition("PushNow"), SuggestionDisposition::PushNow));
+        assert!(matches!(parse_disposition("Drop"), SuggestionDisposition::Drop));
+        assert!(matches!(parse_disposition("InboxOnly"), SuggestionDisposition::InboxOnly));
+    }
+
+    #[test]
+    fn cooldown_guard_gates_by_interval() {
+        let g = CooldownGuard::new();
+        // At time 0 the cooldown has elapsed (0 - 0 >= threshold trivially, since last=0).
+        assert!(g.can_episode_synth(EPISODE_COOLDOWN_SECS * 1_000_000));
+        assert!(!g.can_episode_synth(1)); // 1us since epoch < 3min cooldown
+        assert!(g.can_daily_synth(DAILY_COOLDOWN_SECS * 1_000_000));
+        assert!(!g.can_daily_synth(1));
+    }
+
+    #[test]
+    fn cooldown_guard_detects_date_rollover() {
+        let mut g = CooldownGuard::new();
+        // First call seeds the date and reports no rollover.
+        assert!(!g.check_date_rollover("2026-07-23"));
+        assert!(!g.check_date_rollover("2026-07-23"));
+        // A new date reports rollover once.
+        assert!(g.check_date_rollover("2026-07-24"));
+        assert!(!g.check_date_rollover("2026-07-24"));
+    }
+
+    #[test]
+    fn proactive_store_round_trips_suggestion() {
+        let path = std::env::temp_dir().join(format!("shadow-proactive-{}", uuid::Uuid::new_v4()));
+        let store = ProactiveStore::new(&path).unwrap();
+        let mut s = suggestion(SuggestionType::Reminder, 0.7);
+        s.disposition = SuggestionDisposition::PushNow;
+        store.store(&s).unwrap();
+
+        let got = store.get(&s.id).unwrap().expect("stored suggestion");
+        assert_eq!(got.title, "title");
+        assert!(matches!(got.suggestion_type, SuggestionType::Reminder));
+        assert!(matches!(got.disposition, SuggestionDisposition::PushNow));
+
+        let recent = store.list_recent(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn proactive_store_recent_titles_respects_window() {
+        let path = std::env::temp_dir().join(format!("shadow-proactive-{}", uuid::Uuid::new_v4()));
+        let store = ProactiveStore::new(&path).unwrap();
+        let mut fresh = suggestion(SuggestionType::Reminder, 0.7);
+        fresh.title = "fresh".to_string();
+        fresh.created_at = wall_micros();
+        store.store(&fresh).unwrap();
+
+        let titles = store.recent_titles(3600);
+        assert!(titles.contains(&"fresh".to_string()));
+
+        // An old suggestion outside the window is excluded.
+        let mut old = suggestion(SuggestionType::Reminder, 0.7);
+        old.title = "ancient".to_string();
+        old.created_at = 1; // ~epoch
+        store.store(&old).unwrap();
+        let recent = store.recent_titles(3600);
+        assert!(recent.contains(&"fresh".to_string()));
+        assert!(!recent.contains(&"ancient".to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn proactive_store_get_missing_returns_none() {
+        let path = std::env::temp_dir().join(format!("shadow-proactive-{}", uuid::Uuid::new_v4()));
+        let store = ProactiveStore::new(&path).unwrap();
+        assert!(store.get("nope").unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+}

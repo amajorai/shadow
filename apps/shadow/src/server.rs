@@ -1,7 +1,8 @@
 use axum::{
     extract::ws::{Message, WebSocket},
-    extract::{Path, Query, State, WebSocketUpgrade},
+    extract::{Path, Query, Request, State, WebSocketUpgrade},
     http::StatusCode,
+    middleware::{from_fn, Next},
     response::sse::Event,
     response::{IntoResponse, Json, Response, Sse},
     routing::{get, post},
@@ -10,6 +11,7 @@ use axum::{
 use futures_util::stream::{BoxStream, StreamExt};
 
 use crate::utils::wall_micros;
+use axum::http::header::{AUTHORIZATION, ORIGIN};
 use axum::http::{HeaderValue, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -91,6 +93,118 @@ pub fn set_app_allowlist(apps: Vec<String>) {
     if let Ok(mut list) = allowlist_cell().write() {
         *list = apps;
     }
+}
+
+// ─── API token (loopback auth) ────────────────────────────────────────────────
+//
+// Shadow is loopback-bound, but "loopback" is not an auth boundary: any local
+// process — or any web page via a no-preflight `text/plain` POST or DNS
+// rebinding — can reach it. Everything except `/health` therefore requires a
+// shared-secret bearer (mirroring the `RYU_EXT_TOKEN` gate the apps-store
+// sidecars use, e.g. `apps-store/quests/backend/src/main.rs`): without it a
+// hostile page could exfiltrate full screen history (`/search`, `/timeline`,
+// `/frame`, …), silently flip `/capture/control` to re-enable capture behind
+// the user's back, or poison the timeline via `/ingest`.
+
+/// Name of the persisted token file under the Shadow data dir.
+const API_TOKEN_FILE: &str = "api-token";
+
+/// Resolve the API token: `SHADOW_API_TOKEN` env if set (Core injects it at
+/// spawn; operators may export their own), else the persisted
+/// `<data_dir>/api-token` file, generated on first run with owner-only
+/// permissions so any same-user local client (Core, sidecars) can read it while
+/// web pages and other users cannot. Returns `None` only when the file can
+/// neither be read nor created — the auth gate then FAILS CLOSED (rejects all).
+fn resolve_api_token(data_dir: &std::path::Path) -> Option<String> {
+    if let Ok(env_token) = std::env::var("SHADOW_API_TOKEN") {
+        let trimmed = env_token.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+
+    let path = data_dir.join(API_TOKEN_FILE);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+
+    // First run: mint a random token (2× UUIDv4 = 64 hex chars from the OS
+    // CSPRNG) and persist it owner-only.
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    if let Err(e) = std::fs::create_dir_all(data_dir) {
+        tracing::error!("cannot create data dir for API token file: {e}");
+        return None;
+    }
+    if let Err(e) = std::fs::write(&path, &token) {
+        tracing::error!("cannot persist API token to {}: {e}", path.display());
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Some(token)
+}
+
+/// Shared-secret bearer + anti-CSRF gate for everything except `/health`.
+///
+/// Requests carrying an `Origin` header are rejected outright (browsers always
+/// attach it to cross-origin requests, so this is the CSRF/DNS-rebinding
+/// kill-switch — no browser context may drive this API, token or not). Native
+/// loopback clients present `Authorization: Bearer <token>`.
+///
+/// **Fail-closed:** `expected == None`/empty (token could not be resolved)
+/// rejects every request rather than falling open.
+async fn require_api_token(req: Request, next: Next, expected: Option<&str>) -> Response {
+    if req.headers().contains_key(ORIGIN) {
+        return (
+            StatusCode::FORBIDDEN,
+            "cross-origin (browser) requests are not allowed",
+        )
+            .into_response();
+    }
+    let provided = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if bearer_ok(provided, expected) {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    }
+}
+
+/// Pure bearer check (factored out so the auth decision is unit-testable without
+/// an axum `Request`/`Next`). Returns `true` only when `expected` is a non-empty
+/// token AND `provided` equals it (constant-time compared). A `None`/empty
+/// `expected` is the fail-closed case → always `false`.
+fn bearer_ok(provided: Option<&str>, expected: Option<&str>) -> bool {
+    let Some(expected) = expected.filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    ct_eq(provided.unwrap_or("").as_bytes(), expected.as_bytes())
+}
+
+/// Constant-time byte comparison — no early return on the first mismatched byte,
+/// so the token check does not leak length/prefix via timing.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Shared server state.
@@ -251,7 +365,9 @@ pub async fn run_server(state: AppState) -> anyhow::Result<()> {
 
 fn build_router(state: AppState) -> Router {
     // CORS: allow the Desktop webview (dev + prod) and localhost dev servers to
-    // read context snapshots from this loopback-only sidecar. Mirrors Core's list.
+    // probe `/health` on this loopback-only sidecar. Mirrors Core's list. Every
+    // other route rejects browser (Origin-bearing) requests in
+    // `require_api_token`, so the allowlist effectively applies to health only.
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(tower_http::cors::Any)
@@ -262,9 +378,19 @@ fn build_router(state: AppState) -> Router {
             "https://tauri.localhost".parse::<HeaderValue>().unwrap(),
         ]);
 
-    Router::new()
+    // Shared-secret bearer over every data-reading + mutating route (`/health`
+    // stays open for liveness probes — it returns no capture data).
+    let api_token = resolve_api_token(&state.config.data_dir);
+    if api_token.is_some() {
+        tracing::info!("shadow: HTTP API requires the shared-secret bearer (all routes except /health)");
+    } else {
+        tracing::warn!(
+            "shadow: no API token available (SHADOW_API_TOKEN unset and the api-token file could not be read or created); all routes except /health are FAIL-CLOSED (reject all)"
+        );
+    }
+
+    let protected = Router::new()
         // Core
-        .route("/health", get(health_handler))
         .route("/stop", get(stop_handler))
         // Search
         .route("/search", get(search_handler))
@@ -328,6 +454,14 @@ fn build_router(state: AppState) -> Router {
         .route("/clips/{id}/frame", get(clips_frame_handler))
         .route("/clips/{id}/diagnostics", post(clips_diagnostics_handler))
         .route("/clips/{id}/file", get(clips_file_handler))
+        .layer(from_fn(move |req: Request, next: Next| {
+            let expected = api_token.clone();
+            async move { require_api_token(req, next, expected.as_deref()).await }
+        }));
+
+    Router::new()
+        .route("/health", get(health_handler))
+        .merge(protected)
         .layer(cors)
         .with_state(state)
 }
@@ -595,8 +729,8 @@ struct ClipFrameQuery {
 /// GET /clips/{id}/frame?atMs= — a single JPEG frame at the requested moment.
 async fn clips_frame_handler(Path(id): Path<String>, Query(q): Query<ClipFrameQuery>) -> Response {
     let at_ms = q.at_ms;
-    let path = tokio::task::spawn_blocking(move || crate::capture::clip::extract_frame(&id, at_ms))
-        .await;
+    let path =
+        tokio::task::spawn_blocking(move || crate::capture::clip::extract_frame(&id, at_ms)).await;
     let path = match path {
         Ok(Ok(p)) => p,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -629,6 +763,11 @@ async fn clips_diagnostics_handler(
 
 /// GET /clips/{id}/file — the muxed clip.mp4 bytes.
 async fn clips_file_handler(Path(id): Path<String>) -> Response {
+    // `clip_file_path` joins the id under the clips root; a percent-decoded
+    // `../` id would escape it, so validate before touching the filesystem.
+    if !crate::capture::clip::is_valid_clip_id(&id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let path = crate::capture::clip::clip_file_path(&id);
     match tokio::fs::read(&path).await {
         Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "video/mp4")], bytes).into_response(),
@@ -821,7 +960,10 @@ async fn recent_activity_handler(
                 }));
             }
             Err(e) => {
-                tracing::debug!("recent_activity frame read failed for {}: {e}", kf.file_path);
+                tracing::debug!(
+                    "recent_activity frame read failed for {}: {e}",
+                    kf.file_path
+                );
             }
         }
     }
@@ -829,7 +971,10 @@ async fn recent_activity_handler(
     // Short markdown summary + transcript from the timeline OCR/events.
     let (summary, transcript) = match shadow_core::query_time_range(start, now) {
         Ok(entries) => build_activity_text(minutes, &entries),
-        Err(_) => (format!("Recent activity (last {minutes} min)"), String::new()),
+        Err(_) => (
+            format!("Recent activity (last {minutes} min)"),
+            String::new(),
+        ),
     };
 
     Json(json!({
@@ -1467,6 +1612,19 @@ async fn intent_handler(
 mod tests {
     use super::*;
 
+    /// `CAPTURE_PAUSED` / `APP_ALLOWLIST` are process-global statics and the test
+    /// harness runs tests on parallel threads, so every test that mutates or
+    /// observes them must hold this lock or they race each other flakily.
+    /// `unwrap_or_else(PoisonError::into_inner)` keeps one panicking test from
+    /// cascading poison into the rest.
+    static CAPTURE_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_state_guard() -> std::sync::MutexGuard<'static, ()> {
+        CAPTURE_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Build a minimal AppState with all optional fields set to None.
     /// The handler must return a well-formed response even with no capture subsystems.
     fn minimal_state() -> AppState {
@@ -1484,6 +1642,36 @@ mod tests {
             window_tracker: None,
             ax_tree: None,
         }
+    }
+
+    #[test]
+    fn bearer_ok_matches_only_exact_nonempty_token() {
+        assert!(bearer_ok(Some("secret"), Some("secret")));
+        assert!(!bearer_ok(Some("secret"), Some("other")));
+        assert!(!bearer_ok(Some("secre"), Some("secret")));
+        assert!(!bearer_ok(None, Some("secret")));
+    }
+
+    #[test]
+    fn bearer_ok_is_fail_closed_without_expected() {
+        // No configured token must reject everything, never fall open.
+        assert!(!bearer_ok(Some("secret"), None));
+        assert!(!bearer_ok(Some(""), Some("")));
+        assert!(!bearer_ok(None, None));
+    }
+
+    #[test]
+    fn resolve_api_token_mints_once_and_rereads_the_same_value() {
+        let dir = std::env::temp_dir().join(format!(
+            "shadow-token-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // First resolution mints + persists; second reads the same value back.
+        let minted = resolve_api_token(&dir).expect("token minted");
+        assert!(minted.len() >= 32, "token must not be trivially short");
+        let reread = resolve_api_token(&dir).expect("token reread");
+        assert_eq!(minted, reread);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1692,6 +1880,7 @@ mod tests {
     /// AC4: when globally paused, /context/current must return the empty/suppressed state.
     #[tokio::test]
     async fn test_current_context_returns_empty_when_paused() {
+        let _guard = capture_state_guard();
         // Set paused=true for this test; restore after.
         set_capture_paused(true);
         let resp = invoke_handler(minimal_state()).await;
@@ -1721,6 +1910,7 @@ mod tests {
     /// Verify is_capture_allowed returns false when globally paused.
     #[test]
     fn test_is_capture_allowed_respects_pause() {
+        let _guard = capture_state_guard();
         set_capture_paused(true);
         let allowed = is_capture_allowed("SomeApp");
         set_capture_paused(false);
@@ -1730,6 +1920,7 @@ mod tests {
     /// Verify is_capture_allowed returns true when allowlist is empty (allow all).
     #[test]
     fn test_is_capture_allowed_empty_allowlist_allows_all() {
+        let _guard = capture_state_guard();
         set_capture_paused(false);
         set_app_allowlist(vec![]);
         assert!(
@@ -1741,6 +1932,7 @@ mod tests {
     /// Verify is_capture_allowed filters when allowlist is non-empty.
     #[test]
     fn test_is_capture_allowed_non_empty_allowlist() {
+        let _guard = capture_state_guard();
         set_capture_paused(false);
         set_app_allowlist(vec!["VSCode".to_string(), "Terminal".to_string()]);
 
@@ -1755,5 +1947,438 @@ mod tests {
 
         // Restore empty allowlist so other tests are not affected.
         set_app_allowlist(vec![]);
+    }
+
+    // ─── ct_eq (constant-time compare) ───────────────────────────────────────
+
+    #[test]
+    fn ct_eq_matches_only_equal_slices() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        // Length mismatch is rejected without indexing past the shorter slice.
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    // ─── frame/capture toggles ───────────────────────────────────────────────
+
+    #[test]
+    fn frame_capture_toggle_round_trips() {
+        let _guard = capture_state_guard();
+        set_frame_capture_enabled(false);
+        assert!(!is_frame_capture_enabled());
+        set_frame_capture_enabled(true);
+        assert!(is_frame_capture_enabled());
+    }
+
+    // ─── DB-free / security-relevant handler paths ───────────────────────────
+
+    #[tokio::test]
+    async fn health_handler_reports_healthy() {
+        let resp = health_handler(State(minimal_state())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn meeting_status_handler_returns_ok() {
+        let resp = meeting_status_handler().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn meeting_start_rejects_non_http_scheme() {
+        let req = MeetingStartRequest {
+            meeting_id: "m1".to_string(),
+            ingest_url: Some("https://127.0.0.1:7980/api/meetings/m1/chunk".to_string()),
+        };
+        let resp = meeting_start_handler(Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn meeting_start_rejects_remote_host() {
+        let req = MeetingStartRequest {
+            meeting_id: "m1".to_string(),
+            ingest_url: Some("http://evil.example.com:7980/api/meetings/m1/chunk".to_string()),
+        };
+        let resp = meeting_start_handler(Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn clips_context_missing_clip_is_not_found() {
+        let resp = clips_context_handler(axum::extract::Path(
+            "nonexistent-clip-id".to_string(),
+        ))
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn clips_file_rejects_path_traversal_id() {
+        // A percent-decoded "../" id must be rejected before any fs access.
+        let resp =
+            clips_file_handler(axum::extract::Path("../../etc/passwd".to_string()))
+                .await
+                .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn clips_pause_without_recording_is_not_found() {
+        let resp = clips_pause_handler(axum::extract::Path("c1".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn clips_resume_without_recording_is_not_found() {
+        let resp = clips_resume_handler(axum::extract::Path("c1".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn intent_handler_uses_heuristic_without_orchestrator() {
+        let req = IntentRequest {
+            query: "remind me to call the dentist".to_string(),
+        };
+        let resp = intent_handler(State(minimal_state()), Json(req))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ─── build_activity_text (pure) ──────────────────────────────────────────
+
+    fn timeline_entry(app: Option<&str>, title: Option<&str>) -> shadow_core::timeline::TimelineEntry {
+        shadow_core::timeline::TimelineEntry {
+            ts: 0,
+            track: 0,
+            event_type: "focus".to_string(),
+            app_name: app.map(str::to_string),
+            window_title: title.map(str::to_string),
+            url: None,
+            display_id: None,
+            segment_file: String::new(),
+        }
+    }
+
+    #[test]
+    fn build_activity_text_summarizes_apps_and_dedups_consecutive_focus() {
+        let entries = vec![
+            timeline_entry(Some("Mail"), Some("Inbox")),
+            timeline_entry(Some("Mail"), Some("Inbox")), // duplicate → collapsed
+            timeline_entry(Some("Slack"), Some("general")),
+        ];
+        let (summary, transcript) = build_activity_text(5, &entries);
+        assert!(summary.contains("Apps seen: Mail, Slack."));
+        // Consecutive identical focus is collapsed to a single line.
+        assert_eq!(transcript, "Mail: Inbox\nSlack: general");
+    }
+
+    #[test]
+    fn build_activity_text_handles_empty_and_partial_entries() {
+        let (summary, transcript) = build_activity_text(3, &[]);
+        assert!(summary.contains("No window focus was captured"));
+        assert_eq!(transcript, "");
+
+        // App with no title, and title with no app.
+        let entries = vec![
+            timeline_entry(Some("Terminal"), None),
+            timeline_entry(None, Some("Untitled")),
+        ];
+        let (_s, transcript) = build_activity_text(3, &entries);
+        assert_eq!(transcript, "Terminal\nUntitled");
+    }
+
+    // ─── shadow_core-backed handlers: graceful uninitialized-store path ───────
+    //
+    // The global shadow_core storage is never initialized in this test binary,
+    // so these query functions return a graceful Err that the handler turns into
+    // a JSON error payload (HTTP 200) or a 404 — no panic, fully hermetic.
+
+    #[tokio::test]
+    async fn search_handler_returns_json_when_store_uninitialized() {
+        let resp = search_handler(Query(SearchQuery {
+            q: "anything".to_string(),
+            limit: Some(5),
+            category: None,
+        }))
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn semantic_search_handler_returns_json_when_store_uninitialized() {
+        let resp = semantic_search_handler(
+            State(minimal_state()),
+            Query(SearchQuery {
+                q: "anything".to_string(),
+                limit: None,
+                category: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn timeline_handler_returns_json_when_store_uninitialized() {
+        let resp = timeline_handler(Query(TimelineQuery { start: 0, end: 1 }))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn journal_handler_returns_json_without_narration() {
+        let resp = journal_handler(
+            State(minimal_state()),
+            Query(JournalQuery {
+                start: 0,
+                end: 1,
+                narrate: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn journal_weekly_handler_returns_json() {
+        let resp = journal_weekly_handler(Query(WeeklyQuery {
+            end: 10 * 86_400 * 1_000_000,
+            days: Some(2),
+        }))
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn recent_context_handler_returns_json() {
+        let resp = recent_context_handler(Query(SearchQuery {
+            q: "10".to_string(),
+            limit: None,
+            category: None,
+        }))
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn recent_activity_handler_returns_json_bundle() {
+        let resp = recent_activity_handler(Query(RecentActivityQuery { minutes: Some(3) }))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn frame_handler_returns_not_found_when_no_keyframe() {
+        let resp = frame_handler(Query(FrameQuery {
+            ts: 0,
+            display: None,
+        }))
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── State-based handlers: graceful None-store paths ─────────────────────
+
+    #[tokio::test]
+    async fn capture_control_get_returns_current_state() {
+        let _guard = capture_state_guard();
+        let resp = capture_control_get_handler().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn capture_control_post_applies_and_reflects_changes() {
+        let _guard = capture_state_guard();
+        let req = CaptureControlRequest {
+            paused: Some(true),
+            app_allowlist: Some(vec!["Mail".to_string()]),
+            frames: Some(false),
+            history_retention_days: None,
+        };
+        let resp = capture_control_post_handler(Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(is_capture_paused());
+        // Restore globals for other tests.
+        set_capture_paused(false);
+        set_app_allowlist(vec![]);
+        set_frame_capture_enabled(true);
+    }
+
+    #[tokio::test]
+    async fn agent_tools_handler_empty_without_orchestrator() {
+        let resp = agent_tools_handler(State(minimal_state())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn proactive_handler_empty_without_store() {
+        let resp = proactive_handler(State(minimal_state())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn proactive_handler_lists_from_real_store() {
+        let path = std::env::temp_dir().join(format!("shadow-srv-proactive-{}", uuid::Uuid::new_v4()));
+        let store = crate::intelligence::ProactiveStore::new(&path).unwrap();
+        let mut state = minimal_state();
+        state.proactive_store = Some(Arc::new(tokio::sync::Mutex::new(store)));
+        let resp = proactive_handler(State(state)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn summaries_and_summary_by_id_without_store() {
+        let resp = summaries_handler(State(minimal_state())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = summary_by_id_handler(
+            State(minimal_state()),
+            axum::extract::Path("missing".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn generate_summary_without_orchestrator_errors_gracefully() {
+        let req = GenerateSummaryRequest {
+            start_ts: 0,
+            end_ts: 1,
+        };
+        let resp = generate_summary_handler(State(minimal_state()), Json(req))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn memory_handlers_without_global_store() {
+        let resp = memory_query_handler(Query(SearchQuery {
+            q: "x".to_string(),
+            limit: None,
+            category: Some("fact".to_string()),
+        }))
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = memory_store_handler(Json(json!({"content": "hi"})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = directives_handler().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = create_directive_handler(Json(json!({"content": "call back"})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn procedures_handler_empty_without_store() {
+        let resp = procedures_handler(State(minimal_state())).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ingest_handler_counts_written_events() {
+        // Events fail to persist without a store, so ingested count is 0 — the
+        // handler still returns a well-formed response.
+        let req = IngestRequest { events: vec![] };
+        let resp = ingest_handler(Json(req)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn synthesize_handler_without_orchestrator() {
+        let req = SynthesizeRequest { actions: vec![] };
+        let resp = synthesize_handler(State(minimal_state()), Json(req))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn feedback_handler_without_delivery_manager() {
+        let req = FeedbackRequest {
+            suggestion_type: "reminder".to_string(),
+            kind: "thumbs_up".to_string(),
+        };
+        let resp = feedback_handler(State(minimal_state()), Json(req))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn feedback_handler_applies_with_delivery_manager() {
+        let trust = Arc::new(std::sync::Mutex::new(crate::intelligence::TrustTuner::new()));
+        let dm = Arc::new(crate::intelligence::DeliveryManager::new(trust, true));
+        let mut state = minimal_state();
+        state.delivery_manager = Some(dm);
+        for kind in ["thumbs_up", "thumbs_down", "snooze", "dismiss"] {
+            let req = FeedbackRequest {
+                suggestion_type: "reminder".to_string(),
+                kind: kind.to_string(),
+            };
+            let resp = feedback_handler(State(state.clone()), Json(req))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn patterns_handler_empty_without_store() {
+        let resp = patterns_handler(
+            State(minimal_state()),
+            Query(PatternsQuery {
+                q: None,
+                app: None,
+                limit: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn patterns_handler_queries_real_store() {
+        let dir = std::env::temp_dir().join(format!("shadow-srv-pat-{}", uuid::Uuid::new_v4()));
+        let store = crate::agent::PatternStore::new(&dir);
+        let mut state = minimal_state();
+        state.pattern_store = Some(Arc::new(std::sync::Mutex::new(store)));
+        let resp = patterns_handler(
+            State(state),
+            Query(PatternsQuery {
+                q: Some("send email".to_string()),
+                app: Some("Mail".to_string()),
+                limit: Some(5),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

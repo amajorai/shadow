@@ -71,3 +71,85 @@ impl MemoryStore {
         self.directive.check_triggers(context)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `MemoryStore` facade over two stores backed by the same temp db.
+    /// (The struct's `directive` field is private, so `init_memory` is the public
+    /// path; but we only need a facade instance here, constructed via the stores.)
+    fn facade(path: &std::path::Path) -> MemoryStore {
+        MemoryStore {
+            semantic: SemanticMemoryStore::new(path).unwrap(),
+            directive: DirectiveMemoryStore::new(path).unwrap(),
+        }
+    }
+
+    fn temp_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("shadow-memfacade-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn facade_semantic_upsert_query_delete() {
+        let path = temp_db();
+        let store = facade(&path);
+        store
+            .upsert(&MemoryEntry {
+                id: "s1".to_string(),
+                category: "preference".to_string(),
+                content: "likes tea".to_string(),
+                confidence: 0.8,
+                source_episode_id: None,
+                access_count: 0,
+                last_accessed: 0,
+                created_at: 1,
+            })
+            .unwrap();
+        assert_eq!(store.query(Some("preference"), "tea").unwrap().len(), 1);
+        store.delete_entry("s1").unwrap();
+        assert!(store.query(None, "tea").unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn facade_directive_create_list_complete_and_triggers() {
+        let path = temp_db();
+        let store = facade(&path);
+        store
+            .create_directive(&Directive {
+                id: "d1".to_string(),
+                directive_type: "watch".to_string(),
+                content: "watch invoices".to_string(),
+                trigger_pattern: Some("invoice".to_string()),
+                action: None,
+                priority: 5,
+                expires_at: None,
+                created_at: 1,
+            })
+            .unwrap();
+        assert_eq!(store.list_active(None).unwrap().len(), 1);
+        assert_eq!(store.check_triggers("new INVOICE arrived").unwrap().len(), 1);
+        assert!(store.check_triggers("nothing relevant").unwrap().is_empty());
+
+        store.complete_directive("d1").unwrap();
+        assert!(store.list_active(None).unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn init_memory_sets_the_global_once() {
+        let path = std::env::temp_dir()
+            .join(format!("shadow-initmem-{}", uuid::Uuid::new_v4()))
+            .join("memory.db");
+        // First init succeeds and populates the global (unless a prior test in
+        // this binary already claimed it — tolerate both).
+        let first = init_memory(&path);
+        if first.is_ok() {
+            assert!(MEMORY_STORE.get().is_some());
+            // A second init must fail — the OnceLock is already set.
+            assert!(init_memory(&path).is_err());
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+}

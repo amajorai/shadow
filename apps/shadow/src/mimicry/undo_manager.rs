@@ -126,3 +126,126 @@ impl Default for ExecutionUndoManager {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(action: &str) -> UndoEntry {
+        UndoEntry {
+            step_index: 0,
+            action_type: action.to_string(),
+            ax_tree_hash: 0,
+            timestamp_us: 0,
+            app_context: None,
+            scroll_dx: None,
+            scroll_dy: None,
+        }
+    }
+
+    #[test]
+    fn push_peek_pop_are_lifo() {
+        let mut m = ExecutionUndoManager::new();
+        assert!(m.is_empty());
+        m.push(entry("ax_click"));
+        m.push(entry("ax_type"));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.peek().unwrap().action_type, "ax_type");
+        assert_eq!(m.pop().unwrap().action_type, "ax_type");
+        assert_eq!(m.pop().unwrap().action_type, "ax_click");
+        assert!(m.pop().is_none());
+    }
+
+    #[test]
+    fn push_step_builds_entry() {
+        let mut m = ExecutionUndoManager::new();
+        m.push_step(3, "ax_scroll", 42, Some("Mail".to_string()), Some(5), Some(-5));
+        let e = m.peek().unwrap();
+        assert_eq!(e.step_index, 3);
+        assert_eq!(e.action_type, "ax_scroll");
+        assert_eq!(e.ax_tree_hash, 42);
+        assert_eq!(e.app_context.as_deref(), Some("Mail"));
+        assert_eq!(e.scroll_dx, Some(5));
+    }
+
+    #[test]
+    fn push_trims_oldest_beyond_max_size() {
+        let mut m = ExecutionUndoManager::new();
+        for i in 0..60 {
+            let mut e = entry("ax_click");
+            e.step_index = i;
+            m.push(e);
+        }
+        assert_eq!(m.len(), 50, "stack capped at max_size");
+        // Oldest (step_index 0..9) trimmed; the bottom is now step 10.
+        assert_eq!(m.pop().unwrap().step_index, 59);
+    }
+
+    #[test]
+    fn clear_empties_stack() {
+        let mut m = ExecutionUndoManager::new();
+        m.push(entry("ax_click"));
+        m.clear();
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn compute_reversal_click_type_hotkey_use_undo_shortcut() {
+        for action in ["ax_click", "ax_type", "ax_hotkey"] {
+            assert!(matches!(
+                ExecutionUndoManager::compute_reversal(&entry(action)),
+                UndoStrategy::UndoShortcut
+            ));
+        }
+    }
+
+    #[test]
+    fn compute_reversal_scroll_negates_deltas() {
+        let mut e = entry("ax_scroll");
+        e.scroll_dx = Some(7);
+        e.scroll_dy = Some(-3);
+        match ExecutionUndoManager::compute_reversal(&e) {
+            UndoStrategy::ReverseScroll { dx, dy } => {
+                assert_eq!(dx, -7);
+                assert_eq!(dy, 3);
+            }
+            other => panic!("expected ReverseScroll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_reversal_focus_app_switches_back_or_manual() {
+        let mut with_ctx = entry("ax_focus_app");
+        with_ctx.app_context = Some("Slack".to_string());
+        match ExecutionUndoManager::compute_reversal(&with_ctx) {
+            UndoStrategy::SwitchBack(app) => assert_eq!(app, "Slack"),
+            other => panic!("expected SwitchBack, got {other:?}"),
+        }
+        // No app context → Manual.
+        assert!(matches!(
+            ExecutionUndoManager::compute_reversal(&entry("ax_focus_app")),
+            UndoStrategy::Manual(_)
+        ));
+    }
+
+    #[test]
+    fn compute_reversal_unknown_action_is_manual() {
+        assert!(matches!(
+            ExecutionUndoManager::compute_reversal(&entry("ax_teleport")),
+            UndoStrategy::Manual(_)
+        ));
+    }
+
+    #[test]
+    fn pop_reversal_pops_and_computes() {
+        let mut m = ExecutionUndoManager::new();
+        m.push(entry("ax_click"));
+        assert!(matches!(m.pop_reversal(), Some(UndoStrategy::UndoShortcut)));
+        assert!(m.pop_reversal().is_none());
+    }
+
+    #[test]
+    fn default_is_empty() {
+        assert!(ExecutionUndoManager::default().is_empty());
+    }
+}

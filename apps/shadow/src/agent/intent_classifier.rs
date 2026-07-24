@@ -88,26 +88,30 @@ impl IntentClassifier {
     pub fn classify_heuristic(query: &str) -> Intent {
         let q = query.to_lowercase();
 
-        // UI action keywords
-        if contains_any(
-            &q,
-            &[
-                "open ",
-                "click",
-                "type ",
-                "press ",
-                "navigate to",
-                "go to ",
-                "close ",
-                "minimize",
-                "maximize",
-                "drag",
-                "scroll",
-                "automate",
-                "do ",
-                "run on screen",
-            ],
-        ) {
+        // UI action keywords. "do" is only an imperative when it LEADS the query
+        // ("do the export flow") — as a bare substring it swallowed every word
+        // ending in "do" ("redo the steps") and past-tense memory queries
+        // ("what did I do yesterday"), shadowing the later intent arms.
+        if q.trim_start().starts_with("do ")
+            || contains_any(
+                &q,
+                &[
+                    "open ",
+                    "click",
+                    "type ",
+                    "press ",
+                    "navigate to",
+                    "go to ",
+                    "close ",
+                    "minimize",
+                    "maximize",
+                    "drag",
+                    "scroll",
+                    "automate",
+                    "run on screen",
+                ],
+            )
+        {
             return Intent::UiAction;
         }
         // Procedure learning
@@ -214,5 +218,136 @@ fn parse_intent_str(s: &str) -> Option<Intent> {
         "ui_action" => Some(Intent::UiAction),
         "ambiguous" => Some(Intent::Ambiguous),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(q: &str) -> Intent {
+        IntentClassifier::classify_heuristic(q)
+    }
+
+    #[test]
+    fn ui_action_keywords() {
+        assert_eq!(h("open Gmail"), Intent::UiAction);
+        assert_eq!(h("click the Send button"), Intent::UiAction);
+        assert_eq!(h("type hello into the box"), Intent::UiAction);
+        assert_eq!(h("navigate to example.com"), Intent::UiAction);
+        assert_eq!(h("scroll down the page"), Intent::UiAction);
+        assert_eq!(h("minimize the window"), Intent::UiAction);
+    }
+
+    #[test]
+    fn procedure_learning_keywords() {
+        assert_eq!(h("record what I'm working on"), Intent::ProcedureLearning);
+        assert_eq!(h("watch me fill the form"), Intent::ProcedureLearning);
+        assert_eq!(h("teach the assistant"), Intent::ProcedureLearning);
+    }
+
+    #[test]
+    fn procedure_replay_keywords() {
+        assert_eq!(h("replay that sequence"), Intent::ProcedureReplay);
+        assert_eq!(h("run the procedure again"), Intent::ProcedureReplay);
+        assert_eq!(h("execute procedure now"), Intent::ProcedureReplay);
+    }
+
+    #[test]
+    fn do_is_only_an_imperative_when_it_leads_the_query() {
+        // Regression: "do " as a bare substring classified every word ending in
+        // "do" (and past-tense memory queries) as UiAction, shadowing the later
+        // intent arms. Leading imperative still wins; the others now fall through
+        // to their real intents.
+        assert_eq!(h("do the login flow"), Intent::UiAction);
+        assert_eq!(h("redo the steps"), Intent::ProcedureReplay);
+        assert_eq!(h("what did I do yesterday"), Intent::MemorySearch);
+    }
+
+    #[test]
+    fn directive_creation_keywords() {
+        assert_eq!(h("remind me to reply"), Intent::DirectiveCreation);
+        assert_eq!(
+            h("remember that I prefer dark mode"),
+            Intent::DirectiveCreation
+        );
+        assert_eq!(
+            h("never send without confirming"),
+            Intent::DirectiveCreation
+        );
+        assert_eq!(h("whenever I open Slack, mute it"), Intent::UiAction);
+    }
+
+    #[test]
+    fn memory_search_keywords() {
+        assert_eq!(h("search my transcripts"), Intent::MemorySearch);
+        assert_eq!(h("find the meeting notes"), Intent::MemorySearch);
+        assert_eq!(h("show me yesterday's activity"), Intent::MemorySearch);
+        assert_eq!(h("recall the address"), Intent::MemorySearch);
+    }
+
+    #[test]
+    fn complex_reasoning_keywords() {
+        assert_eq!(h("analyze my spending"), Intent::ComplexReasoning);
+        assert_eq!(h("compare the two drafts"), Intent::ComplexReasoning);
+        assert_eq!(h("summarize this thread"), Intent::ComplexReasoning);
+    }
+
+    #[test]
+    fn simple_question_via_prefix_or_question_mark() {
+        assert_eq!(h("what is the time"), Intent::SimpleQuestion);
+        assert_eq!(h("who owns this file"), Intent::SimpleQuestion);
+        assert_eq!(h("is everything saved?"), Intent::SimpleQuestion);
+    }
+
+    #[test]
+    fn ambiguous_when_nothing_matches() {
+        assert_eq!(h("hello there friend"), Intent::Ambiguous);
+        assert_eq!(h("the quick brown fox"), Intent::Ambiguous);
+    }
+
+    #[test]
+    fn ui_action_takes_precedence_over_directive() {
+        // "always " is a directive keyword and "open " is a UI keyword; UI is
+        // checked first, so the UI intent wins.
+        assert_eq!(h("always open the terminal"), Intent::UiAction);
+    }
+
+    #[test]
+    fn memory_search_takes_precedence_over_complex_reasoning() {
+        // Contains both "search" (memory, checked first) and "analyze" (reasoning).
+        assert_eq!(h("search then analyze the logs"), Intent::MemorySearch);
+    }
+
+    #[test]
+    fn classification_is_case_insensitive() {
+        assert_eq!(h("OPEN the App"), Intent::UiAction);
+        assert_eq!(h("ReMiNd me later"), Intent::DirectiveCreation);
+    }
+
+    #[test]
+    fn as_str_round_trips_through_parse() {
+        let all = [
+            Intent::SimpleQuestion,
+            Intent::MemorySearch,
+            Intent::ProcedureReplay,
+            Intent::ProcedureLearning,
+            Intent::ComplexReasoning,
+            Intent::DirectiveCreation,
+            Intent::UiAction,
+            Intent::Ambiguous,
+        ];
+        for intent in all {
+            let s = intent.as_str();
+            assert_eq!(parse_intent_str(s), Some(intent.clone()), "label {s}");
+        }
+    }
+
+    #[test]
+    fn parse_intent_str_rejects_unknown() {
+        assert_eq!(parse_intent_str("nonsense"), None);
+        assert_eq!(parse_intent_str(""), None);
+        // Case-sensitive: the LLM path lowercases before calling, so uppercase is unknown.
+        assert_eq!(parse_intent_str("UI_ACTION"), None);
     }
 }
