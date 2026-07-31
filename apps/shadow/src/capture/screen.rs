@@ -441,6 +441,10 @@ pub struct LinuxScreenCapture {
 impl LinuxScreenCapture {
     pub fn new() -> Result<Self> {
         use x11rb::connection::Connection;
+        // ConnectionExt is what carries `get_geometry` — without it this block
+        // fails E0599 ("no method named `get_geometry`"). Easy to lose because
+        // the sibling block below glob-imports `xproto::*` and so compiles.
+        use x11rb::protocol::xproto::ConnectionExt;
         use x11rb::rust_connection::RustConnection;
         let (conn, screen_num) =
             RustConnection::connect(None).map_err(|e| anyhow::anyhow!("X11 connect: {}", e))?;
@@ -681,11 +685,18 @@ pub fn get_primary_display_size() -> (u32, u32) {
     #[cfg(target_os = "linux")]
     {
         use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::ConnectionExt; // carries `get_geometry`
         use x11rb::rust_connection::RustConnection;
         if let Ok((conn, sn)) = RustConnection::connect(None) {
             let screen = &conn.setup().roots[sn];
-            if let Ok(geom) = conn.get_geometry(screen.root).and_then(|c| c.reply()) {
-                return (geom.width as u32, geom.height as u32);
+            // Stepwise rather than `.and_then(|c| c.reply())`: the cookie is
+            // Result<_, ConnectionError> and reply() is Result<_, ReplyError>,
+            // and there is no From<ReplyError> for ConnectionError, so chaining
+            // them fails E0277. Splitting sidesteps the error unification.
+            if let Ok(cookie) = conn.get_geometry(screen.root) {
+                if let Ok(geom) = cookie.reply() {
+                    return (geom.width as u32, geom.height as u32);
+                }
             }
         }
         (1920, 1080)

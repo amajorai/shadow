@@ -505,14 +505,10 @@ mod linux_ax {
             .and_then(|p| String::from_utf8(p.value).ok())
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                conn.get_property(
-                    false,
-                    win_id,
-                    AtomEnum::WM_NAME.into(),
-                    AtomEnum::STRING.into(),
-                    0,
-                    1024,
-                )
+                // Pass the AtomEnum variants directly: get_property takes
+                // `impl Into<Atom>`, so an explicit `.into()` has no unique
+                // target type and fails E0283 ("type annotations needed").
+                conn.get_property(false, win_id, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 1024)
                 .ok()
                 .and_then(|r| r.reply().ok())
                 .and_then(|p| String::from_utf8(p.value).ok())
@@ -552,10 +548,15 @@ mod linux_ax {
         if depth > 2 {
             return vec![];
         }
-        let Ok(tree) = conn
-            .query_tree(parent)
-            .and_then(|r| r.reply().map_err(Into::into))
-        else {
+        // Stepwise rather than `.and_then(|r| r.reply().map_err(Into::into))`:
+        // the cookie is Result<_, ConnectionError> and reply() is
+        // Result<_, ReplyError>. There is no From<ReplyError> for
+        // ConnectionError (the conversion goes the other way), so the chained
+        // form fails E0277.
+        let Ok(cookie) = conn.query_tree(parent) else {
+            return vec![];
+        };
+        let Ok(tree) = cookie.reply() else {
             return vec![];
         };
 
