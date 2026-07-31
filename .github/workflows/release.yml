@@ -62,6 +62,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Must point at the manifest's own dir: with no root Cargo.toml the
+          # action finds nothing at the repo root ("could not find Cargo.toml").
+          workspaces: apps/shadow
       # Established by enumerating the -sys crates in the Linux dep graph
       # (alsa-sys via cpal, openssl-sys, dbus, opus). Never guard with `|| true`:
       # a missing dep must fail loudly at build time.
@@ -84,10 +88,10 @@ jobs:
           # exactly, and extract_from_zip matches a name ending "shadow.exe".
           case "${{ matrix.ext }}" in
             tar.gz)
-              tar -czf "$out" -C target/release "shadow"
+              tar -czf "$out" -C apps/shadow/target/release "shadow"
               ;;
             zip)
-              powershell -NoProfile -Command "Compress-Archive -Path 'target/release/shadow.exe' -DestinationPath '$out' -Force"
+              powershell -NoProfile -Command "Compress-Archive -Path 'apps/shadow/target/release/shadow.exe' -DestinationPath '$out' -Force"
               ;;
           esac
           if [ ! -s "$out" ]; then
