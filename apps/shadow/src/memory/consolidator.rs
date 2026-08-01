@@ -280,7 +280,9 @@ mod tests {
             content: "uses Slack".to_string(),
             confidence: 0.6,
         };
-        let n = consolidator.apply_facts(std::slice::from_ref(&fact), &store).unwrap();
+        let n = consolidator
+            .apply_facts(std::slice::from_ref(&fact), &store)
+            .unwrap();
         assert_eq!(n, 1);
         let stored = store.list_by_category("habit").unwrap();
         assert_eq!(stored.len(), 1);

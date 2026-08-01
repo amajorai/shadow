@@ -465,7 +465,10 @@ mod tests {
 
     #[test]
     fn modifier_flags_empty_is_null() {
-        assert_eq!(macos_modifier_flags(&[]).bits(), CGEventFlags::CGEventFlagNull.bits());
+        assert_eq!(
+            macos_modifier_flags(&[]).bits(),
+            CGEventFlags::CGEventFlagNull.bits()
+        );
     }
 
     #[test]

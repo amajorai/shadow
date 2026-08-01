@@ -214,7 +214,10 @@ mod tests {
         assert_eq!(r.sub_tasks[0].role, AgentRole::MemoryManager);
         assert!(r.sub_tasks[0].dependencies.is_empty());
         assert_eq!(r.sub_tasks[1].role, AgentRole::General);
-        assert_eq!(r.sub_tasks[1].dependencies, vec!["memory_search".to_string()]);
+        assert_eq!(
+            r.sub_tasks[1].dependencies,
+            vec!["memory_search".to_string()]
+        );
         // Timeout is the sum of both sub-task timeouts.
         assert_eq!(r.estimated_timeout_s, 30);
     }

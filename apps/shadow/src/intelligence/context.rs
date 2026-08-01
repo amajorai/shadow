@@ -445,7 +445,11 @@ mod tests {
     fn get_recent_episodes_returns_from_store_without_timeline() {
         let path = temp_db();
         let store = Arc::new(Mutex::new(EpisodeStore::new(&path).unwrap()));
-        store.lock().unwrap().save(&record("e1", "Mail", 10, 20)).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .save(&record("e1", "Mail", 10, 20))
+            .unwrap();
 
         let synth = ContextSynthesizer {
             episode_store: Some(store),

@@ -614,12 +614,15 @@ mod tests {
     #[test]
     fn apply_policy_filters_dropped_and_sets_disposition() {
         let raw = vec![
-            suggestion(SuggestionType::DailyDigest, 0.95), // push
+            suggestion(SuggestionType::DailyDigest, 0.95),  // push
             suggestion(SuggestionType::ContextSwitch, 0.1), // drop
         ];
         let kept = apply_policy(raw, TickType::Fast, None);
         assert_eq!(kept.len(), 1);
-        assert!(matches!(kept[0].disposition, SuggestionDisposition::PushNow));
+        assert!(matches!(
+            kept[0].disposition,
+            SuggestionDisposition::PushNow
+        ));
     }
 
     #[test]
@@ -630,7 +633,10 @@ mod tests {
         ] suffix";
         let out = parse_suggestions(content);
         assert_eq!(out.len(), 2);
-        assert!(matches!(out[0].suggestion_type, SuggestionType::MeetingPrep));
+        assert!(matches!(
+            out[0].suggestion_type,
+            SuggestionType::MeetingPrep
+        ));
         assert!((out[0].confidence - 0.8).abs() < 1e-5);
         // Unknown type falls back to Followup, missing confidence defaults 0.5.
         assert!(matches!(out[1].suggestion_type, SuggestionType::Followup));
@@ -657,19 +663,46 @@ mod tests {
 
     #[test]
     fn parse_suggestion_type_reads_debug_strings() {
-        assert!(matches!(parse_suggestion_type("MeetingPrep"), SuggestionType::MeetingPrep));
-        assert!(matches!(parse_suggestion_type("WorkloadPattern"), SuggestionType::WorkloadPattern));
-        assert!(matches!(parse_suggestion_type("Reminder"), SuggestionType::Reminder));
-        assert!(matches!(parse_suggestion_type("ContextSwitch"), SuggestionType::ContextSwitch));
-        assert!(matches!(parse_suggestion_type("DailyDigest"), SuggestionType::DailyDigest));
-        assert!(matches!(parse_suggestion_type("Followup"), SuggestionType::Followup));
+        assert!(matches!(
+            parse_suggestion_type("MeetingPrep"),
+            SuggestionType::MeetingPrep
+        ));
+        assert!(matches!(
+            parse_suggestion_type("WorkloadPattern"),
+            SuggestionType::WorkloadPattern
+        ));
+        assert!(matches!(
+            parse_suggestion_type("Reminder"),
+            SuggestionType::Reminder
+        ));
+        assert!(matches!(
+            parse_suggestion_type("ContextSwitch"),
+            SuggestionType::ContextSwitch
+        ));
+        assert!(matches!(
+            parse_suggestion_type("DailyDigest"),
+            SuggestionType::DailyDigest
+        ));
+        assert!(matches!(
+            parse_suggestion_type("Followup"),
+            SuggestionType::Followup
+        ));
     }
 
     #[test]
     fn parse_disposition_reads_debug_strings() {
-        assert!(matches!(parse_disposition("PushNow"), SuggestionDisposition::PushNow));
-        assert!(matches!(parse_disposition("Drop"), SuggestionDisposition::Drop));
-        assert!(matches!(parse_disposition("InboxOnly"), SuggestionDisposition::InboxOnly));
+        assert!(matches!(
+            parse_disposition("PushNow"),
+            SuggestionDisposition::PushNow
+        ));
+        assert!(matches!(
+            parse_disposition("Drop"),
+            SuggestionDisposition::Drop
+        ));
+        assert!(matches!(
+            parse_disposition("InboxOnly"),
+            SuggestionDisposition::InboxOnly
+        ));
     }
 
     #[test]

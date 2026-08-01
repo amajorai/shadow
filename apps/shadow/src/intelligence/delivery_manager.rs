@@ -99,17 +99,26 @@ mod tests {
     #[test]
     fn high_confidence_pushes_when_push_enabled() {
         // Default push threshold is 0.82.
-        assert_eq!(manager(true).deliver(&suggestion(0.9)), DeliveryDecision::Push);
+        assert_eq!(
+            manager(true).deliver(&suggestion(0.9)),
+            DeliveryDecision::Push
+        );
     }
 
     #[test]
     fn mid_confidence_goes_to_inbox() {
-        assert_eq!(manager(true).deliver(&suggestion(0.6)), DeliveryDecision::Inbox);
+        assert_eq!(
+            manager(true).deliver(&suggestion(0.6)),
+            DeliveryDecision::Inbox
+        );
     }
 
     #[test]
     fn low_confidence_drops() {
-        assert_eq!(manager(true).deliver(&suggestion(0.2)), DeliveryDecision::Drop);
+        assert_eq!(
+            manager(true).deliver(&suggestion(0.2)),
+            DeliveryDecision::Drop
+        );
     }
 
     #[test]

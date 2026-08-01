@@ -129,7 +129,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.list_active(None).unwrap().len(), 1);
-        assert_eq!(store.check_triggers("new INVOICE arrived").unwrap().len(), 1);
+        assert_eq!(
+            store.check_triggers("new INVOICE arrived").unwrap().len(),
+            1
+        );
         assert!(store.check_triggers("nothing relevant").unwrap().is_empty());
 
         store.complete_directive("d1").unwrap();

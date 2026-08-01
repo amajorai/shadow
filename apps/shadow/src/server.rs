@@ -382,7 +382,9 @@ fn build_router(state: AppState) -> Router {
     // stays open for liveness probes — it returns no capture data).
     let api_token = resolve_api_token(&state.config.data_dir);
     if api_token.is_some() {
-        tracing::info!("shadow: HTTP API requires the shared-secret bearer (all routes except /health)");
+        tracing::info!(
+            "shadow: HTTP API requires the shared-secret bearer (all routes except /health)"
+        );
     } else {
         tracing::warn!(
             "shadow: no API token available (SHADOW_API_TOKEN unset and the api-token file could not be read or created); all routes except /health are FAIL-CLOSED (reject all)"
@@ -2007,21 +2009,18 @@ mod tests {
 
     #[tokio::test]
     async fn clips_context_missing_clip_is_not_found() {
-        let resp = clips_context_handler(axum::extract::Path(
-            "nonexistent-clip-id".to_string(),
-        ))
-        .await
-        .into_response();
+        let resp = clips_context_handler(axum::extract::Path("nonexistent-clip-id".to_string()))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn clips_file_rejects_path_traversal_id() {
         // A percent-decoded "../" id must be rejected before any fs access.
-        let resp =
-            clips_file_handler(axum::extract::Path("../../etc/passwd".to_string()))
-                .await
-                .into_response();
+        let resp = clips_file_handler(axum::extract::Path("../../etc/passwd".to_string()))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2054,7 +2053,10 @@ mod tests {
 
     // ─── build_activity_text (pure) ──────────────────────────────────────────
 
-    fn timeline_entry(app: Option<&str>, title: Option<&str>) -> shadow_core::timeline::TimelineEntry {
+    fn timeline_entry(
+        app: Option<&str>,
+        title: Option<&str>,
+    ) -> shadow_core::timeline::TimelineEntry {
         shadow_core::timeline::TimelineEntry {
             ts: 0,
             track: 0,
@@ -2211,7 +2213,9 @@ mod tests {
             frames: Some(false),
             history_retention_days: None,
         };
-        let resp = capture_control_post_handler(Json(req)).await.into_response();
+        let resp = capture_control_post_handler(Json(req))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(is_capture_paused());
         // Restore globals for other tests.
@@ -2222,19 +2226,24 @@ mod tests {
 
     #[tokio::test]
     async fn agent_tools_handler_empty_without_orchestrator() {
-        let resp = agent_tools_handler(State(minimal_state())).await.into_response();
+        let resp = agent_tools_handler(State(minimal_state()))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn proactive_handler_empty_without_store() {
-        let resp = proactive_handler(State(minimal_state())).await.into_response();
+        let resp = proactive_handler(State(minimal_state()))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn proactive_handler_lists_from_real_store() {
-        let path = std::env::temp_dir().join(format!("shadow-srv-proactive-{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("shadow-srv-proactive-{}", uuid::Uuid::new_v4()));
         let store = crate::intelligence::ProactiveStore::new(&path).unwrap();
         let mut state = minimal_state();
         state.proactive_store = Some(Arc::new(tokio::sync::Mutex::new(store)));
@@ -2245,7 +2254,9 @@ mod tests {
 
     #[tokio::test]
     async fn summaries_and_summary_by_id_without_store() {
-        let resp = summaries_handler(State(minimal_state())).await.into_response();
+        let resp = summaries_handler(State(minimal_state()))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         let resp = summary_by_id_handler(
             State(minimal_state()),
@@ -2295,7 +2306,9 @@ mod tests {
 
     #[tokio::test]
     async fn procedures_handler_empty_without_store() {
-        let resp = procedures_handler(State(minimal_state())).await.into_response();
+        let resp = procedures_handler(State(minimal_state()))
+            .await
+            .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

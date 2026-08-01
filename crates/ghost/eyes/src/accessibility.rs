@@ -630,7 +630,8 @@ mod macos_ax {
         #[test]
         fn returns_first_match_depth_first() {
             let mut root = leaf("AXWindow", Some("target-word"), None);
-            root.children.push(leaf("AXButton", Some("target-word"), None));
+            root.children
+                .push(leaf("AXButton", Some("target-word"), None));
             // Root matches first in a pre-order traversal.
             let found = find_in_tree(&root, "target-word").expect("match");
             assert_eq!(found.role, "AXWindow");

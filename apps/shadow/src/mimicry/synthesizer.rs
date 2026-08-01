@@ -311,7 +311,8 @@ mod tests {
 
     #[test]
     fn build_synthesis_prompt_numbers_steps_and_names_app() {
-        let prompt = build_synthesis_prompt(&["Clicked X".to_string(), "Typed Y".to_string()], "Mail");
+        let prompt =
+            build_synthesis_prompt(&["Clicked X".to_string(), "Typed Y".to_string()], "Mail");
         assert!(prompt.contains("recorded actions in Mail"));
         assert!(prompt.contains("1. Clicked X"));
         assert!(prompt.contains("2. Typed Y"));
@@ -342,11 +343,20 @@ mod tests {
     fn event_to_tool_maps_type_hotkey_scroll_switch_and_default() {
         let mut typed = ev("type");
         typed.key = Some("hi".to_string());
-        assert_eq!(event_to_tool(&typed), ("ax_type".to_string(), serde_json::json!({"text": "hi"})));
+        assert_eq!(
+            event_to_tool(&typed),
+            ("ax_type".to_string(), serde_json::json!({"text": "hi"}))
+        );
 
         let mut hk = ev("hotkey");
         hk.key = Some("cmd+c".to_string());
-        assert_eq!(event_to_tool(&hk), ("ax_hotkey".to_string(), serde_json::json!({"keys": "cmd+c"})));
+        assert_eq!(
+            event_to_tool(&hk),
+            (
+                "ax_hotkey".to_string(),
+                serde_json::json!({"keys": "cmd+c"})
+            )
+        );
 
         let (scroll_tool, scroll_args) = event_to_tool(&ev("scroll"));
         assert_eq!(scroll_tool, "ax_scroll");
@@ -370,7 +380,10 @@ mod tests {
         assert_eq!(template.steps[0].step_number, 1);
         assert_eq!(template.steps[1].step_number, 2);
         // Heuristic steps use Skip on failure.
-        assert!(matches!(template.steps[0].on_failure, StepFailureAction::Skip));
+        assert!(matches!(
+            template.steps[0].on_failure,
+            StepFailureAction::Skip
+        ));
     }
 
     #[test]
@@ -384,7 +397,10 @@ mod tests {
         assert_eq!(template.description, "send a mail");
         assert_eq!(template.steps.len(), 1);
         assert_eq!(template.steps[0].tool_name, "ax_click");
-        assert!(matches!(template.steps[0].on_failure, StepFailureAction::Retry));
+        assert!(matches!(
+            template.steps[0].on_failure,
+            StepFailureAction::Retry
+        ));
     }
 
     #[test]

@@ -86,8 +86,14 @@ pub fn start(data_dir: &Path) {
     let token_file = token_file.to_string_lossy();
     let bash = dir.join("shadow-hook.sh");
     let pwsh = dir.join("shadow-hook.ps1");
-    let _ = std::fs::write(&bash, BASH_HOOK.replace(TOKEN_FILE_PLACEHOLDER, &token_file));
-    let _ = std::fs::write(&pwsh, PWSH_HOOK.replace(TOKEN_FILE_PLACEHOLDER, &token_file));
+    let _ = std::fs::write(
+        &bash,
+        BASH_HOOK.replace(TOKEN_FILE_PLACEHOLDER, &token_file),
+    );
+    let _ = std::fs::write(
+        &pwsh,
+        PWSH_HOOK.replace(TOKEN_FILE_PLACEHOLDER, &token_file),
+    );
     tracing::info!(
         "Terminal capture ready (opt-in). Enable by sourcing:\n  bash/zsh: source {}\n  PowerShell: . {}",
         bash.display(),

@@ -143,7 +143,9 @@ mod tests {
     fn create_then_list_active_returns_it() {
         let path = temp_db();
         let store = DirectiveMemoryStore::new(&path).unwrap();
-        store.create(&directive("d1", "reminder", "call back", 5)).unwrap();
+        store
+            .create(&directive("d1", "reminder", "call back", 5))
+            .unwrap();
         let active = store.list_active(None).unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, "d1");
@@ -154,8 +156,12 @@ mod tests {
     fn list_active_orders_by_priority_desc() {
         let path = temp_db();
         let store = DirectiveMemoryStore::new(&path).unwrap();
-        store.create(&directive("lo", "reminder", "low", 1)).unwrap();
-        store.create(&directive("hi", "reminder", "high", 9)).unwrap();
+        store
+            .create(&directive("lo", "reminder", "low", 1))
+            .unwrap();
+        store
+            .create(&directive("hi", "reminder", "high", 9))
+            .unwrap();
         let active = store.list_active(None).unwrap();
         assert_eq!(active[0].id, "hi");
         assert_eq!(active[1].id, "lo");
@@ -178,7 +184,9 @@ mod tests {
     fn completed_directives_are_excluded() {
         let path = temp_db();
         let store = DirectiveMemoryStore::new(&path).unwrap();
-        store.create(&directive("d1", "reminder", "done", 5)).unwrap();
+        store
+            .create(&directive("d1", "reminder", "done", 5))
+            .unwrap();
         store.complete("d1").unwrap();
         assert!(store.list_active(None).unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
@@ -203,12 +211,17 @@ mod tests {
         d.trigger_pattern = Some("Invoice".to_string());
         store.create(&d).unwrap();
         // Directive without a trigger must never match.
-        store.create(&directive("d2", "reminder", "no trigger", 5)).unwrap();
+        store
+            .create(&directive("d2", "reminder", "no trigger", 5))
+            .unwrap();
 
         let matched = store.check_triggers("New INVOICE from vendor").unwrap();
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].id, "d1");
-        assert!(store.check_triggers("unrelated context").unwrap().is_empty());
+        assert!(store
+            .check_triggers("unrelated context")
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_file(&path);
     }
 }

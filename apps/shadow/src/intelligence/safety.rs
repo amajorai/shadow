@@ -195,7 +195,10 @@ mod tests {
         let r = gate
             .check("delete_file", &json!({"file_path": "/etc/hosts"}))
             .await;
-        assert!(r.is_err(), "destructive tool + file path must be hard-blocked");
+        assert!(
+            r.is_err(),
+            "destructive tool + file path must be hard-blocked"
+        );
     }
 
     #[tokio::test]

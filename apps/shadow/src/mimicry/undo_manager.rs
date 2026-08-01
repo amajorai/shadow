@@ -159,7 +159,14 @@ mod tests {
     #[test]
     fn push_step_builds_entry() {
         let mut m = ExecutionUndoManager::new();
-        m.push_step(3, "ax_scroll", 42, Some("Mail".to_string()), Some(5), Some(-5));
+        m.push_step(
+            3,
+            "ax_scroll",
+            42,
+            Some("Mail".to_string()),
+            Some(5),
+            Some(-5),
+        );
         let e = m.peek().unwrap();
         assert_eq!(e.step_index, 3);
         assert_eq!(e.action_type, "ax_scroll");

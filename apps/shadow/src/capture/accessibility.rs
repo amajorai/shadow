@@ -509,10 +509,10 @@ mod linux_ax {
                 // `impl Into<Atom>`, so an explicit `.into()` has no unique
                 // target type and fails E0283 ("type annotations needed").
                 conn.get_property(false, win_id, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 1024)
-                .ok()
-                .and_then(|r| r.reply().ok())
-                .and_then(|p| String::from_utf8(p.value).ok())
-                .filter(|s| !s.is_empty())
+                    .ok()
+                    .and_then(|r| r.reply().ok())
+                    .and_then(|p| String::from_utf8(p.value).ok())
+                    .filter(|s| !s.is_empty())
             });
 
         // Window geometry

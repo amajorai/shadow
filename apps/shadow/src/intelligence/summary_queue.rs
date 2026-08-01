@@ -229,7 +229,10 @@ mod tests {
 
     #[test]
     fn queue_error_displays_message() {
-        assert_eq!(QueueError::Full.to_string(), "queue full (max pending reached)");
+        assert_eq!(
+            QueueError::Full.to_string(),
+            "queue full (max pending reached)"
+        );
     }
 
     #[test]

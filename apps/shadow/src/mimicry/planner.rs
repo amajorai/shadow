@@ -139,8 +139,14 @@ mod tests {
 
     #[test]
     fn parse_failure_action_maps_known_variants() {
-        assert!(matches!(parse_failure_action("skip"), StepFailureAction::Skip));
-        assert!(matches!(parse_failure_action("retry"), StepFailureAction::Retry));
+        assert!(matches!(
+            parse_failure_action("skip"),
+            StepFailureAction::Skip
+        ));
+        assert!(matches!(
+            parse_failure_action("retry"),
+            StepFailureAction::Retry
+        ));
         assert!(matches!(
             parse_failure_action("escalate"),
             StepFailureAction::Escalate
@@ -149,8 +155,14 @@ mod tests {
 
     #[test]
     fn parse_failure_action_defaults_to_abort() {
-        assert!(matches!(parse_failure_action("abort"), StepFailureAction::Abort));
-        assert!(matches!(parse_failure_action("bogus"), StepFailureAction::Abort));
+        assert!(matches!(
+            parse_failure_action("abort"),
+            StepFailureAction::Abort
+        ));
+        assert!(matches!(
+            parse_failure_action("bogus"),
+            StepFailureAction::Abort
+        ));
         assert!(matches!(parse_failure_action(""), StepFailureAction::Abort));
     }
 
