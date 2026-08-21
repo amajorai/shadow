@@ -36,9 +36,9 @@ jobs:
             printf 'Ryu as a whole lives at https://github.com/amajorai/ryu.\n'
           } > release-notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --notes-file release-notes.md
+            gh release edit "$TAG" --prerelease=false --latest --notes-file release-notes.md
           else
-            gh release create "$TAG" --title "${GITHUB_REPOSITORY##*/} $TAG" --target "$GITHUB_SHA" --notes-file release-notes.md
+            gh release create "$TAG" --latest --title "${GITHUB_REPOSITORY##*/} $TAG" --target "$GITHUB_SHA" --notes-file release-notes.md
           fi
 
   build:
