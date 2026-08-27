@@ -198,6 +198,7 @@ mod tests {
             primary_app: "Cursor".into(),
             event_count: 3,
             distraction: false,
+            apps: Vec::new(),
             distractions: Vec::new(),
         }
     }

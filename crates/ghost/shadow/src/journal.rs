@@ -35,9 +35,21 @@ pub struct JournalCard {
     pub event_count: u32,
     /// True when the card as a whole is a distraction (idle/entertainment).
     pub distraction: bool,
+    /// Distinct applications involved in the card, in first-seen order.
+    #[serde(default)]
+    pub apps: Vec<JournalApp>,
     /// Brief (<5 min) unrelated interruptions *inside* an otherwise focused
     /// card. Empty from the deterministic pass; populated by the narrator.
     pub distractions: Vec<CardDistraction>,
+}
+
+/// A local application identity used by the desktop host to resolve the native
+/// icon. `app_path` never needs to cross the sandbox bridge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JournalApp {
+    pub name: String,
+    pub bundle_id: Option<String>,
+    pub app_path: Option<String>,
 }
 
 /// A short distraction nested inside a focused card (Dayflow model): a 2–5 min
@@ -362,6 +374,7 @@ fn bucket_to_card(index: usize, bucket: CardBucket) -> JournalCard {
 
     let summary = card_summary(event_count, &primary_app, &category, &bucket.entries);
     let detailed_summary = card_detailed_summary(&bucket.entries, &primary_app);
+    let apps = apps_in_entries(&bucket.entries);
 
     JournalCard {
         id: format!("journal-{}-{}", bucket.start_ts, index),
@@ -374,6 +387,7 @@ fn bucket_to_card(index: usize, bucket: CardBucket) -> JournalCard {
         primary_app,
         event_count,
         distraction,
+        apps,
         distractions: Vec::new(),
     }
 }
@@ -423,6 +437,75 @@ fn normalized_app(entry: &TimelineEntry) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or("Unknown")
         .to_string()
+}
+
+fn normalized_optional(value: Option<&String>) -> Option<String> {
+    value
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn app_identity_matches(existing: &JournalApp, candidate: &JournalApp) -> bool {
+    let bundle_conflict = existing
+        .bundle_id
+        .as_deref()
+        .zip(candidate.bundle_id.as_deref())
+        .is_some_and(|(a, b)| !a.eq_ignore_ascii_case(b));
+    if bundle_conflict {
+        return false;
+    }
+
+    let path_conflict = existing
+        .app_path
+        .as_deref()
+        .zip(candidate.app_path.as_deref())
+        .is_some_and(|(a, b)| a != b);
+    if path_conflict {
+        return false;
+    }
+
+    let shared_bundle = existing
+        .bundle_id
+        .as_deref()
+        .zip(candidate.bundle_id.as_deref())
+        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+    let shared_path = existing
+        .app_path
+        .as_deref()
+        .zip(candidate.app_path.as_deref())
+        .is_some_and(|(a, b)| a == b);
+
+    shared_bundle || shared_path || existing.name.eq_ignore_ascii_case(&candidate.name)
+}
+
+fn apps_in_entries(entries: &[TimelineEntry]) -> Vec<JournalApp> {
+    let mut apps = Vec::new();
+
+    for entry in entries {
+        let candidate = JournalApp {
+            name: normalized_app(entry),
+            bundle_id: normalized_optional(entry.bundle_id.as_ref()),
+            app_path: normalized_optional(entry.app_path.as_ref()),
+        };
+
+        if let Some(existing) = apps
+            .iter_mut()
+            .find(|existing| app_identity_matches(existing, &candidate))
+        {
+            if existing.bundle_id.is_none() {
+                existing.bundle_id = candidate.bundle_id;
+            }
+            if existing.app_path.is_none() {
+                existing.app_path = candidate.app_path;
+            }
+        } else {
+            apps.push(candidate);
+        }
+    }
+
+    apps
 }
 
 fn classify_entry(entry: &TimelineEntry) -> String {
@@ -601,7 +684,29 @@ mod tests {
             track: 3,
             event_type: event_type.to_string(),
             app_name: Some(app.to_string()),
+            bundle_id: None,
+            app_path: None,
             window_title: Some(title.to_string()),
+            url: None,
+            display_id: None,
+            segment_file: "segment.msgpack".to_string(),
+        }
+    }
+
+    fn entry_with_identity(
+        ts: u64,
+        app: &str,
+        bundle_id: Option<&str>,
+        app_path: Option<&str>,
+    ) -> TimelineEntry {
+        TimelineEntry {
+            ts,
+            track: 3,
+            event_type: "app_switch".to_string(),
+            app_name: Some(app.to_string()),
+            bundle_id: bundle_id.map(str::to_string),
+            app_path: app_path.map(str::to_string),
+            window_title: Some("Meet standup".to_string()),
             url: None,
             display_id: None,
             segment_file: "segment.msgpack".to_string(),
@@ -639,6 +744,40 @@ mod tests {
         assert!(snapshot.standup.blockers[0].contains("Potential drift"));
     }
 
+    #[test]
+    fn cards_list_distinct_apps_in_first_seen_order() {
+        let entries = vec![
+            entry_with_identity(
+                1_000_000,
+                "Slack",
+                Some("com.slack.Slack"),
+                Some("/Applications/Slack.app"),
+            ),
+            entry_with_identity(
+                2_000_000,
+                "WhatsApp",
+                Some("com.whatsapp.WhatsApp"),
+                Some("/Applications/WhatsApp.app"),
+            ),
+            entry_with_identity(
+                3_000_000,
+                "Slack",
+                Some("com.slack.Slack"),
+                Some("/Applications/Slack.app"),
+            ),
+            entry_with_identity(4_000_000, "WhatsApp", None, None),
+        ];
+
+        let snapshot = build_journal_snapshot(0, MICROS_PER_MINUTE, &entries);
+        let apps = &snapshot.cards[0].apps;
+
+        assert_eq!(apps.iter().map(|app| app.name.as_str()).collect::<Vec<_>>(), [
+            "Slack", "WhatsApp"
+        ]);
+        assert_eq!(apps[0].bundle_id.as_deref(), Some("com.slack.Slack"));
+        assert_eq!(apps[1].app_path.as_deref(), Some("/Applications/WhatsApp.app"));
+    }
+
     fn card(start_ts: u64, minutes: u64, category: &str, distraction: bool) -> JournalCard {
         JournalCard {
             id: format!("c-{start_ts}"),
@@ -652,6 +791,7 @@ mod tests {
             event_count: 1,
             distraction,
             distractions: Vec::new(),
+            apps: Vec::new(),
         }
     }
 

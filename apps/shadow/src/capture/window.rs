@@ -8,6 +8,8 @@ pub struct WindowInfo {
     pub title: String,
     pub app_name: String,
     pub bundle_id: Option<String>,
+    /// Native application locator used by the desktop host to resolve icons.
+    pub app_path: Option<String>,
     pub pid: i32,
     pub url: Option<String>,
 }
@@ -17,6 +19,7 @@ pub struct WindowInfo {
 pub struct AppInfo {
     pub name: String,
     pub bundle_id: Option<String>,
+    pub app_path: Option<String>,
     pub pid: i32,
     pub is_focused: bool,
 }
@@ -73,6 +76,7 @@ mod windows_impl {
             Some(AppInfo {
                 name: win.app_name,
                 bundle_id: win.bundle_id,
+                app_path: win.app_path,
                 pid: win.pid,
                 is_focused: true,
             })
@@ -129,6 +133,7 @@ mod windows_impl {
                 title,
                 app_name,
                 bundle_id: None,
+                app_path: image_path,
                 pid: pid as i32,
                 url,
             })
@@ -396,6 +401,7 @@ impl WindowTracker for MacOSWindowTracker {
         Some(AppInfo {
             name: w.app_name,
             bundle_id: w.bundle_id,
+            app_path: w.app_path,
             pid: w.pid,
             is_focused: true,
         })
@@ -499,6 +505,23 @@ fn macos_frontmost_window() -> Option<WindowInfo> {
             }
         };
 
+        let bundle_url: *mut objc2::runtime::AnyObject = objc2::msg_send![app, bundleURL];
+        let app_path = if bundle_url.is_null() {
+            None
+        } else {
+            let path_obj: *mut objc2::runtime::AnyObject = objc2::msg_send![bundle_url, path];
+            if path_obj.is_null() {
+                None
+            } else {
+                let cptr: *const c_char = objc2::msg_send![path_obj, UTF8String];
+                if cptr.is_null() {
+                    None
+                } else {
+                    Some(CStr::from_ptr(cptr).to_string_lossy().to_string())
+                }
+            }
+        };
+
         // Get window title via AXUIElement (requires accessibility permissions)
         let ax_app = AXUIElementCreateApplication(pid);
         let title = if !ax_app.is_null() {
@@ -527,6 +550,7 @@ fn macos_frontmost_window() -> Option<WindowInfo> {
             title,
             app_name,
             bundle_id,
+            app_path,
             pid,
             url,
         })
@@ -662,6 +686,7 @@ impl WindowTracker for LinuxWindowTracker {
         Some(AppInfo {
             name: w.app_name,
             bundle_id: None,
+            app_path: w.app_path,
             pid: w.pid,
             is_focused: true,
         })
@@ -874,6 +899,14 @@ fn linux_active_window() -> Option<WindowInfo> {
         .and_then(|p| p.value32()?.next())
         .unwrap_or(0) as i32;
 
+    let app_path = if pid > 0 {
+        std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
     // WM_CLASS: two null-terminated strings (instance, class).
     let (wm_instance, wm_class) = {
         let p = conn
@@ -900,6 +933,7 @@ fn linux_active_window() -> Option<WindowInfo> {
         title,
         app_name,
         bundle_id: None,
+        app_path,
         pid,
         url: None,
     })

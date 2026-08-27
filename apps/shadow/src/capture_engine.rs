@@ -300,6 +300,9 @@ fn ingest_window_event(win: &crate::capture::WindowInfo, ts: u64) {
     map.insert("app_name", rmpv::Value::from(win.app_name.as_str()));
     map.insert("window_title", rmpv::Value::from(win.title.as_str()));
     map.insert("pid", rmpv::Value::from(win.pid));
+    if let Some(app_path) = &win.app_path {
+        map.insert("app_path", rmpv::Value::from(app_path.as_str()));
+    }
     if let Some(url) = &win.url {
         map.insert("url", rmpv::Value::from(url.as_str()));
     }

@@ -2062,6 +2062,8 @@ mod tests {
             track: 0,
             event_type: "focus".to_string(),
             app_name: app.map(str::to_string),
+            bundle_id: None,
+            app_path: None,
             window_title: title.map(str::to_string),
             url: None,
             display_id: None,

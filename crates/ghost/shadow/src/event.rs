@@ -36,6 +36,9 @@ pub struct EventHeader {
     pub pid: Option<i32>,
     #[serde(default)]
     pub bundle_id: Option<String>,
+    /// Platform-native locator used to resolve the installed app icon.
+    #[serde(default)]
+    pub app_path: Option<String>,
 
     // AX enrichment fields (Mimicry Phase A1 — added to mouse_down events)
     #[serde(default)]
@@ -119,6 +122,10 @@ mod tests {
         event.insert("display_id", rmpv::Value::from(69734112u32));
         event.insert("pid", rmpv::Value::from(18492i32));
         event.insert("bundle_id", rmpv::Value::from("com.google.Chrome"));
+        event.insert(
+            "app_path",
+            rmpv::Value::from("/Applications/Google Chrome.app"),
+        );
         event.insert("app_name", rmpv::Value::from("Google Chrome"));
         event.insert("key_code", rmpv::Value::from(13)); // track-specific, not in header
 
@@ -136,5 +143,9 @@ mod tests {
         assert_eq!(header.display_id, Some(69734112));
         assert_eq!(header.pid, Some(18492));
         assert_eq!(header.bundle_id.as_deref(), Some("com.google.Chrome"));
+        assert_eq!(
+            header.app_path.as_deref(),
+            Some("/Applications/Google Chrome.app")
+        );
     }
 }

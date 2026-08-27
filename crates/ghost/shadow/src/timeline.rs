@@ -20,6 +20,8 @@ pub struct TimelineEntry {
     pub track: u8,
     pub event_type: String,
     pub app_name: Option<String>,
+    pub bundle_id: Option<String>,
+    pub app_path: Option<String>,
     pub window_title: Option<String>,
     pub url: Option<String>,
     pub display_id: Option<u32>,
@@ -269,6 +271,7 @@ impl TimelineIndex {
             ("display_id", "INTEGER"),
             ("pid", "INTEGER"),
             ("bundle_id", "TEXT"),
+            ("app_path", "TEXT"),
             ("segment_id", "INTEGER"),
             // Mimicry Phase A1: AX enrichment columns for mouse_down events
             ("ax_role", "TEXT"),
@@ -407,15 +410,17 @@ impl TimelineIndex {
     ) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "INSERT INTO events_index
-                (ts, track, event_type, app_name, window_title, url, segment_file,
-                 seq, session_id, display_id, pid, bundle_id, segment_id,
+                (ts, track, event_type, app_name, bundle_id, app_path, window_title,
+                 url, segment_file, seq, session_id, display_id, pid, segment_id,
                  ax_role, ax_title, ax_identifier, click_x, click_y)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 header.effective_ts() as i64,
                 header.track,
                 header.r#type.as_deref().unwrap_or(""),
                 header.app_name,
+                header.bundle_id,
+                header.app_path,
                 header.window_title,
                 header.url,
                 segment_file,
@@ -423,7 +428,6 @@ impl TimelineIndex {
                 header.session_id,
                 header.display_id,
                 header.pid,
-                header.bundle_id,
                 segment_id,
                 header.ax_role,
                 header.ax_title,
@@ -459,8 +463,8 @@ impl TimelineIndex {
         end_us: u64,
     ) -> Result<Vec<TimelineEntry>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT e.ts, e.track, e.event_type, e.app_name, e.window_title, e.url,
-                    COALESCE(s.path, e.segment_file) as resolved_path,
+            "SELECT e.ts, e.track, e.event_type, e.app_name, e.bundle_id, e.app_path,
+                    e.window_title, e.url, COALESCE(s.path, e.segment_file) as resolved_path,
                     e.display_id
              FROM events_index e
              LEFT JOIN segments s ON e.segment_id = s.segment_id
@@ -474,10 +478,12 @@ impl TimelineIndex {
                 track: row.get::<_, u8>(1)?,
                 event_type: row.get(2)?,
                 app_name: row.get(3)?,
-                window_title: row.get(4)?,
-                url: row.get(5)?,
-                display_id: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
-                segment_file: row.get(6)?,
+                bundle_id: row.get(4)?,
+                app_path: row.get(5)?,
+                window_title: row.get(6)?,
+                url: row.get(7)?,
+                display_id: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                segment_file: row.get(8)?,
             })
         })?;
 
@@ -1983,6 +1989,7 @@ mod tests {
             display_id: None,
             pid: None,
             bundle_id: None,
+            app_path: None,
             ax_role: None,
             ax_title: None,
             ax_identifier: None,
@@ -1999,6 +2006,8 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].app_name.as_deref(), Some("VS Code"));
+        assert_eq!(results[0].bundle_id, None);
+        assert_eq!(results[0].app_path, None);
     }
 
     #[test]
@@ -2025,6 +2034,7 @@ mod tests {
             display_id: Some(69734112),
             pid: Some(1234),
             bundle_id: Some("com.google.Chrome".into()),
+            app_path: Some("/Applications/Google Chrome.app".into()),
             ax_role: None,
             ax_title: None,
             ax_identifier: None,
@@ -2041,6 +2051,10 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].app_name.as_deref(), Some("Chrome"));
+        assert_eq!(
+            results[0].app_path.as_deref(),
+            Some("/Applications/Google Chrome.app")
+        );
     }
 
     #[test]
@@ -2153,6 +2167,7 @@ mod tests {
             display_id: None,
             pid: None,
             bundle_id: None,
+            app_path: None,
             ax_role: None,
             ax_title: None,
             ax_identifier: None,
@@ -2175,6 +2190,7 @@ mod tests {
             display_id: None,
             pid: None,
             bundle_id: None,
+            app_path: None,
             ax_role: None,
             ax_title: None,
             ax_identifier: None,
@@ -2425,6 +2441,7 @@ mod tests {
             display_id: None,
             pid: None,
             bundle_id: Some("com.google.Chrome".into()),
+            app_path: None,
             ax_role: None,
             ax_title: None,
             ax_identifier: None,
@@ -2451,6 +2468,7 @@ mod tests {
             display_id: None,
             pid: None,
             bundle_id: Some("com.microsoft.VSCode".into()),
+            app_path: None,
             ax_role: None,
             ax_title: None,
             ax_identifier: None,
@@ -2618,6 +2636,7 @@ mod tests {
             display_id: None,
             pid: None,
             bundle_id: None,
+            app_path: None,
             ax_role: None,
             ax_title: None,
             ax_identifier: None,
@@ -2673,6 +2692,7 @@ mod tests {
             display_id: None,
             pid: None,
             bundle_id: None,
+            app_path: None,
             ax_role: None,
             ax_title: None,
             ax_identifier: None,
