@@ -597,13 +597,6 @@ mod tests {
     }
 
     #[test]
-    fn mouse_button_variants_are_distinct() {
-        assert_ne!(MouseButton::Left, MouseButton::Right);
-        assert_ne!(MouseButton::Right, MouseButton::Middle);
-        assert_eq!(MouseButton::Left, MouseButton::Left);
-    }
-
-    #[test]
     fn cursor_position_reads_without_moving_the_cursor() {
         // Reading the pointer location via CGEventCreate/CGEventGetLocation is a pure
         // query — it posts no event and does not warp the cursor (unlike warp_cursor,

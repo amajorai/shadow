@@ -4,21 +4,26 @@
 use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use super::types::{Recipe, RecipeStep};
 
 /// Substitute {{param}} placeholders in a string using provided values.
 pub fn substitute(template: &str, params: &HashMap<String, String>) -> String {
-    // Lazily compiled regex for {{param_name}}
-    let re = Regex::new(r"\{\{(\w+)\}\}").expect("valid regex");
-    re.replace_all(template, |caps: &regex::Captures| {
-        let key = &caps[1];
-        params
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| format!("{{{{{key}}}}}"))
-    })
-    .to_string()
+    if !template.contains("{{") {
+        return template.to_owned();
+    }
+    static PARAM_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\{\{(\w+)\}\}").expect("valid regex"));
+    PARAM_RE
+        .replace_all(template, |caps: &regex::Captures| {
+            let key = &caps[1];
+            params
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| format!("{{{{{key}}}}}"))
+        })
+        .to_string()
 }
 
 /// Substitute all string fields in a RecipeStep using the given params.
@@ -65,6 +70,45 @@ pub fn validate_params(recipe: &Recipe, provided: &HashMap<String, String>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn performance_substitution_preserves_literals_and_missing_parameters() {
+        let params = HashMap::from([
+            ("name".to_owned(), "$1 {{other}}".to_owned()),
+            ("名字".to_owned(), "Ada".to_owned()),
+        ]);
+        for template in [
+            "click",
+            "{{name}} {{missing}}",
+            "{{名字}}",
+            "{{ broken }",
+            "{{name}}{{name}}",
+        ] {
+            let expected = Regex::new(r"\{\{(\w+)\}\}")
+                .unwrap()
+                .replace_all(template, |caps: &regex::Captures| {
+                    params
+                        .get(&caps[1])
+                        .cloned()
+                        .unwrap_or_else(|| caps[0].to_string())
+                })
+                .to_string();
+            assert_eq!(substitute(template, &params), expected);
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(Regex::new(r"\{\{(\w+)\}\}").unwrap());
+        }
+        let compilation = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(substitute("click {{name}}", &params));
+        }
+        eprintln!(
+            "100 recipe fields: removed compilation={compilation:?}, warm substitution={:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn test_substitute_basic() {
