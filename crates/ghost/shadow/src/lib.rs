@@ -1175,6 +1175,26 @@ pub fn list_transcript_chunks_in_range(
         })
 }
 
+/// Read whole speech windows that overlap the requested time range.
+pub fn list_transcript_chunks_overlapping(
+    start_us: u64,
+    end_us: u64,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<search::TranscriptChunkResult>, ShadowError> {
+    let search = SEARCH.get().ok_or_else(|| ShadowError::QueryError {
+        msg: "Search index not initialized".into(),
+    })?;
+    let index = search.lock().map_err(|_| ShadowError::QueryError {
+        msg: "Search index lock unavailable".into(),
+    })?;
+    index
+        .list_transcript_chunks_overlapping(start_us, end_us, limit, offset)
+        .map_err(|e| ShadowError::QueryError {
+            msg: format!("List transcript chunks failed: {e}"),
+        })
+}
+
 /// Get the last checkpoint timestamp for a named index.
 /// Used by Swift workers to determine where to resume processing.
 pub fn get_index_checkpoint(index_name: String) -> Result<u64, ShadowError> {

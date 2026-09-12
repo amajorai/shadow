@@ -22,6 +22,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::cors::CorsLayer;
 
 use crate::config::Config;
+use crate::speech_history::transcripts_handler;
 
 // ─── Consent / capture-control globals ────────────────────────────────────────
 //
@@ -399,6 +400,7 @@ fn build_router(state: AppState) -> Router {
         .route("/search/semantic", get(semantic_search_handler))
         // Timeline
         .route("/timeline", get(timeline_handler))
+        .route("/transcripts", get(transcripts_handler))
         .route("/journal", get(journal_handler))
         .route("/journal/weekly", get(journal_weekly_handler))
         .route("/frame", get(frame_handler))

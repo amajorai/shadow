@@ -4,7 +4,7 @@ use std::path::Path;
 
 use log::info;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, QueryParser, RangeQuery, TermQuery};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::*;
 use tantivy::{Index, IndexReader, IndexWriter, Order, ReloadPolicy};
 
@@ -741,6 +741,28 @@ impl SearchIndex {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<TranscriptChunkResult>, SearchError> {
+        self.transcript_chunks(start_us, end_us, limit, offset, false)
+    }
+
+    /// Whole transcript chunks whose audio windows overlap the requested range.
+    pub fn list_transcript_chunks_overlapping(
+        &self,
+        start_us: u64,
+        end_us: u64,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<TranscriptChunkResult>, SearchError> {
+        self.transcript_chunks(start_us, end_us, limit, offset, true)
+    }
+
+    fn transcript_chunks(
+        &self,
+        start_us: u64,
+        end_us: u64,
+        limit: u32,
+        offset: u32,
+        overlapping: bool,
+    ) -> Result<Vec<TranscriptChunkResult>, SearchError> {
         // Input guards
         if limit == 0 || start_us > end_us {
             return Ok(Vec::new());
@@ -757,13 +779,28 @@ impl SearchIndex {
         );
         let range_query = RangeQuery::new_u64_bounds(
             "ts".to_string(),
-            Bound::Included(start_us),
+            if overlapping {
+                Bound::Unbounded
+            } else {
+                Bound::Included(start_us)
+            },
             Bound::Included(end_us),
         );
-        let bool_query = BooleanQuery::new(vec![
+        let mut conditions: Vec<(Occur, Box<dyn Query>)> = vec![
             (Occur::Must, Box::new(term_query)),
             (Occur::Must, Box::new(range_query)),
-        ]);
+        ];
+        if overlapping {
+            conditions.push((
+                Occur::Must,
+                Box::new(RangeQuery::new_u64_bounds(
+                    "ts_end".to_string(),
+                    Bound::Excluded(start_us),
+                    Bound::Unbounded,
+                )),
+            ));
+        }
+        let bool_query = BooleanQuery::new(conditions);
 
         // Collector with pagination and fast-field ordering by ts ascending
         let collector = TopDocs::with_limit(limit)
@@ -1721,6 +1758,25 @@ mod tests {
             app_name: Some("Zoom".to_string()),
             window_title: Some("Meeting".to_string()),
         }
+    }
+
+    #[test]
+    fn speech_rewind_includes_overlapping_windows_and_excludes_old_audio() {
+        let (_tmp, index) = setup_transcript_index(&[
+            make_transcript(10, 30, "overlapping speech", "mic", 1),
+            make_transcript(0, 20, "finished at boundary", "mic", 2),
+            make_transcript(31, 40, "future speech", "mic", 3),
+        ]);
+        let chunks = index
+            .list_transcript_chunks_overlapping(20, 30, 10, 0)
+            .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "overlapping speech");
+        assert_eq!(chunks[0].ts_start, 10);
+        assert!(index
+            .list_transcript_chunks_in_range(20, 30, 10, 0)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

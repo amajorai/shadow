@@ -23,17 +23,25 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - name: Create or update the release
+      - name: Generate and publish DeepSeek V4.1 Flash release notes
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_MODEL: deepseek-v4.1-flash
+          OPENCODE_MAX_TOKENS: "16000"
+          OPENCODE_SESSION_ID: "ryu-${{ github.repository }}-${{ github.run_id }}"
         run: |
           set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving its AI notes unchanged."
+            exit 0
+          fi
+          node scripts/rolling-notes.mjs --channel release --repo "$GITHUB_REPOSITORY" --require-ai > ai-notes.md
           {
-            printf '## %s\n\n' "$TAG"
-            printf 'Part of the Ryu release train at %s.\n\n' "$TAG"
-            printf 'Ryu as a whole lives at https://github.com/amajorai/ryu.\n'
+            printf 'Built from commit `%s`.\n\n' "${GITHUB_SHA:0:7}"
+            cat ai-notes.md
           } > release-notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --prerelease=false --latest --notes-file release-notes.md

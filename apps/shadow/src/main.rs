@@ -8,6 +8,7 @@ mod memory;
 mod mimicry;
 mod ocr;
 mod server;
+mod speech_history;
 mod utils;
 mod video;
 
