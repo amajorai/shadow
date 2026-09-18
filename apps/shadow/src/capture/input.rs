@@ -168,6 +168,9 @@ mod windows_impl {
     }
 
     fn ingest_input_event(event: InputEvent) {
+        if crate::server::is_capture_paused() {
+            return;
+        }
         use std::collections::HashMap;
 
         let mut map: HashMap<&str, rmpv::Value> = HashMap::new();
@@ -435,6 +438,9 @@ mod macos_impl {
     }
 
     fn ingest_input_event(event: super::InputEvent) {
+        if crate::server::is_capture_paused() {
+            return;
+        }
         use std::collections::HashMap;
         let mut map: HashMap<&str, rmpv::Value> = HashMap::new();
         let now_us = std::time::SystemTime::now()
@@ -630,6 +636,9 @@ fn linux_read_device(mut dev: evdev::Device, tx: tokio::sync::mpsc::UnboundedSen
 
 #[cfg(target_os = "linux")]
 fn linux_ingest(event: InputEvent) {
+    if crate::server::is_capture_paused() {
+        return;
+    }
     use std::collections::HashMap;
 
     let mut map: HashMap<&str, rmpv::Value> = HashMap::new();

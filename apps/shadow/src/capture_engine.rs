@@ -153,6 +153,10 @@ impl CaptureEngine {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
+                if crate::server::is_capture_paused() {
+                    continue;
+                }
+
                 // Enumerate displays
                 let displays = screen.lock().await.get_displays();
 
@@ -291,6 +295,9 @@ fn simple_frame_hash(data: &[u8]) -> u64 {
 }
 
 fn ingest_window_event(win: &crate::capture::WindowInfo, ts: u64) {
+    if crate::server::is_capture_paused() {
+        return;
+    }
     use std::collections::HashMap;
     let mut map: HashMap<&str, rmpv::Value> = HashMap::new();
     map.insert("ts", rmpv::Value::from(ts));
@@ -312,6 +319,9 @@ fn ingest_window_event(win: &crate::capture::WindowInfo, ts: u64) {
 }
 
 fn ingest_ocr_event(text: &str, app_name: &str, ts: u64) {
+    if crate::server::is_capture_paused() {
+        return;
+    }
     use std::collections::HashMap;
     let mut map: HashMap<&str, rmpv::Value> = HashMap::new();
     map.insert("ts", rmpv::Value::from(ts));
@@ -332,6 +342,9 @@ fn ingest_ocr_event(text: &str, app_name: &str, ts: u64) {
 }
 
 fn ingest_ax_event(tree: &crate::capture::AXTreeNode, app_name: &str, ts: u64) {
+    if crate::server::is_capture_paused() {
+        return;
+    }
     use std::collections::HashMap;
     let tree_json = serde_json::to_string(tree).unwrap_or_default();
     let mut map: HashMap<&str, rmpv::Value> = HashMap::new();

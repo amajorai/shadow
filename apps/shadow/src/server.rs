@@ -1495,6 +1495,9 @@ async fn handle_websocket(mut socket: WebSocket) {
 // ─── External ingest ──────────────────────────────────────────────────────────
 
 async fn ingest_handler(Json(req): Json<IngestRequest>) -> impl IntoResponse {
+    if is_capture_paused() {
+        return Json(json!({ "ingested": 0, "paused": true }));
+    }
     let mut count = 0u32;
     for event in &req.events {
         if let Ok(data) = rmp_serde::to_vec(event) {

@@ -37,6 +37,24 @@ impl LocalExecutor {
 
     /// Execute a single step. Returns Ok(result) or Err on failure.
     pub async fn execute_step(&self, step: &ProcedureStep) -> Result<serde_json::Value> {
+        match self
+            .safety_gate
+            .check(&step.tool_name, &step.tool_args)
+            .await
+        {
+            Err(error) => return Err(error),
+            Ok(true) => {
+                anyhow::bail!(
+                    "Step {} requires explicit user approval and was not executed",
+                    step.step_number
+                )
+            }
+            Ok(false) => {}
+        }
+        self.execute_step_unchecked(step).await
+    }
+
+    async fn execute_step_unchecked(&self, step: &ProcedureStep) -> Result<serde_json::Value> {
         let tool = self
             .tools
             .iter()
@@ -85,12 +103,15 @@ impl LocalExecutor {
                     ));
                 }
                 Ok(true) => {
-                    // Requires approval — log and continue for now (no approval UI yet)
-                    tracing::warn!(
-                        "Safety gate flagged step {} ('{}') as requiring approval; proceeding",
-                        step.step_number,
-                        step.tool_name
+                    let reason = format!(
+                        "Step {} requires explicit user approval and was not executed",
+                        step.step_number
                     );
+                    let _ = tx.send(MimicryProgress::StepBlocked {
+                        step: step.step_number,
+                        reason: reason.clone(),
+                    });
+                    return Err(anyhow::anyhow!(reason));
                 }
                 Ok(false) => {} // safe
             }
@@ -135,7 +156,7 @@ impl LocalExecutor {
                 None
             };
 
-            match self.execute_step(step).await {
+            match self.execute_step_unchecked(step).await {
                 Ok(result) => {
                     // AX hash verification
                     if let Some(condition) = &step.verification {
