@@ -91,7 +91,7 @@ pub struct LoRATrainer {
 impl LoRATrainer {
     pub fn new(data_dir: &Path) -> Self {
         Self {
-            models_dir: data_dir.join("models"),
+            models_dir: crate::paths::models_dir(),
             training_dir: data_dir.join("training"),
             last_trained: std::sync::Mutex::new(None),
         }

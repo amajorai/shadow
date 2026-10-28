@@ -36,6 +36,9 @@ pub struct AppUsage {
     pub percentage: f32,
 }
 
+/// Content store of `indices/context.db` (sealed `window_title`, `summary`).
+const STORE: &str = "shadow-context";
+
 /// SQLite-backed store for persisting synthesized episode records.
 pub struct EpisodeStore {
     conn: rusqlite::Connection,
@@ -43,9 +46,9 @@ pub struct EpisodeStore {
 
 impl EpisodeStore {
     pub fn new(db_path: &std::path::Path) -> Result<Self> {
-        std::fs::create_dir_all(db_path.parent().unwrap_or(std::path::Path::new(".")))?;
-        let conn = rusqlite::Connection::open(db_path)?;
-        conn.execute_batch(
+        let conn = crate::sealed_db::open(
+            db_path,
+            STORE,
             "CREATE TABLE IF NOT EXISTS episodes (
                 id TEXT PRIMARY KEY,
                 start_us INTEGER NOT NULL,
@@ -60,6 +63,7 @@ impl EpisodeStore {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );",
+            &[("episodes", "window_title"), ("episodes", "summary")],
         )?;
         Ok(Self { conn })
     }
@@ -74,12 +78,28 @@ impl EpisodeStore {
                 ep.start_us as i64,
                 ep.end_us as i64,
                 ep.app_name,
-                ep.window_title,
-                ep.summary,
+                crate::sealed_db::seal(
+                    STORE,
+                    "episodes",
+                    "window_title",
+                    &ep.id,
+                    &ep.window_title
+                )?,
+                crate::sealed_db::seal(STORE, "episodes", "summary", &ep.id, &ep.summary)?,
                 wall_micros() as i64,
             ],
         )?;
         Ok(())
+    }
+
+    /// Delete episodes that ended before `cutoff_us` (Unix microseconds). They
+    /// hold captured app names, window titles and activity summaries, so the
+    /// "Keep history" sweep removes them with the rest of the timeline.
+    pub fn delete_before(&self, cutoff_us: u64) -> Result<usize> {
+        let cutoff = i64::try_from(cutoff_us).unwrap_or(i64::MAX);
+        Ok(self
+            .conn
+            .execute("DELETE FROM episodes WHERE end_us < ?1", [cutoff])?)
     }
 
     pub fn load_recent(&self, n: usize) -> Result<Vec<EpisodeRecord>> {
@@ -89,18 +109,31 @@ impl EpisodeStore {
         )?;
         let rows = stmt
             .query_map([n as i64], |row| {
-                Ok(EpisodeRecord {
-                    id: row.get(0)?,
-                    start_us: row.get::<_, i64>(1)? as u64,
-                    end_us: row.get::<_, i64>(2)? as u64,
-                    app_name: row.get(3)?,
-                    window_title: row.get(4)?,
-                    actions: vec![],
-                    summary: row.get(5)?,
-                    bundle_id: None,
-                })
+                let id: String = row.get(0)?;
+                let title = crate::sealed_db::open_value(
+                    STORE,
+                    "episodes",
+                    "window_title",
+                    &id,
+                    row.get(4)?,
+                );
+                let summary =
+                    crate::sealed_db::open_value(STORE, "episodes", "summary", &id, row.get(5)?);
+                // A row whose sealed text does not open is skipped (and counted).
+                Ok(title
+                    .zip(summary)
+                    .map(|(window_title, summary)| EpisodeRecord {
+                        start_us: row.get::<_, i64>(1).unwrap_or(0) as u64,
+                        end_us: row.get::<_, i64>(2).unwrap_or(0) as u64,
+                        app_name: row.get(3).unwrap_or_default(),
+                        id,
+                        window_title,
+                        actions: vec![],
+                        summary,
+                        bundle_id: None,
+                    }))
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok().flatten())
             .collect();
         Ok(rows)
     }
@@ -362,7 +395,59 @@ mod tests {
     use super::*;
 
     fn temp_db() -> std::path::PathBuf {
+        crate::sealed_db::test_support::key();
         std::env::temp_dir().join(format!("shadow-context-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn episode_text_is_sealed_on_disk_and_legacy_rows_are_sealed_on_open() {
+        let path = temp_db();
+        {
+            // A database written by an earlier build: plaintext text columns.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE episodes (id TEXT PRIMARY KEY, start_us INTEGER NOT NULL,
+                 end_us INTEGER NOT NULL, app_name TEXT NOT NULL, window_title TEXT NOT NULL,
+                 summary TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 INSERT INTO episodes VALUES ('legacy', 1, 2, 'Mail', 'LegacyTitleXyz',
+                 'LegacySummaryXyz', 0);",
+            )
+            .unwrap();
+        }
+        let store = EpisodeStore::new(&path).unwrap();
+        let mut fresh = record("fresh", "Notes", 5, 6);
+        fresh.window_title = "FreshTitleQrs".into();
+        store.save(&fresh).unwrap();
+        let recent = store.load_recent(10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().any(|ep| ep.window_title == "LegacyTitleXyz"));
+        assert!(recent.iter().any(|ep| ep.window_title == "FreshTitleQrs"));
+        store
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        for needle in ["LegacyTitleXyz", "LegacySummaryXyz", "FreshTitleQrs"] {
+            assert!(
+                !crate::sealed_db::test_support::db_contains(&path, needle),
+                "{needle} is on disk in plaintext"
+            );
+        }
+        // A sealed value copied to another row does not open: that row is skipped.
+        store
+            .conn
+            .execute(
+                "UPDATE episodes SET summary = (SELECT summary FROM episodes WHERE id = 'fresh')
+                 WHERE id = 'legacy'",
+                [],
+            )
+            .unwrap();
+        let recent = store.load_recent(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        drop(store);
+        // Reopening runs the migration again: nothing left to do.
+        let store = EpisodeStore::new(&path).unwrap();
+        assert_eq!(store.load_recent(10).unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     fn record(id: &str, app: &str, start_us: u64, end_us: u64) -> EpisodeRecord {
@@ -376,6 +461,27 @@ mod tests {
             summary: "summary".to_string(),
             bundle_id: None,
         }
+    }
+
+    #[test]
+    fn delete_before_removes_only_episodes_that_ended_before_the_cutoff() {
+        let path = temp_db();
+        let store = EpisodeStore::new(&path).unwrap();
+        store.save(&record("old", "Notes", 100, 200)).unwrap();
+        store
+            .save(&record("straddles", "Mail", 900, 1_100))
+            .unwrap();
+        store.save(&record("new", "Slack", 1_200, 1_300)).unwrap();
+
+        assert_eq!(store.delete_before(1_000).unwrap(), 1);
+        let ids: Vec<String> = store
+            .load_recent(10)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["new", "straddles"]);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

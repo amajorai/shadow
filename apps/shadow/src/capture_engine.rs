@@ -47,13 +47,7 @@ pub struct CaptureEngine {
 
 impl CaptureEngine {
     pub fn new() -> Result<Self> {
-        let data_dir = std::env::var("SHADOW_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".shadow")
-            });
+        let data_dir = crate::paths::data_dir();
 
         Ok(Self {
             screen: Arc::new(Mutex::new(PlatformScreenCapture::new()?)),
@@ -90,6 +84,10 @@ impl CaptureEngine {
         // dev box or a desktop without an input device) must still run Shadow
         // for screen context. Same warn-and-continue pattern as the video
         // encoder below and the passive capture sources.
+        {
+            let mut audio = self.audio.lock().await;
+            audio.set_audio_dir(self.data_dir.join("media").join("audio"));
+        }
         match self.audio.lock().await.start().await {
             Ok(()) => tracing::info!("✓ Audio capture started"),
             Err(e) => tracing::warn!("Audio capture unavailable (non-fatal): {}", e),
@@ -131,6 +129,18 @@ impl CaptureEngine {
         self.input.lock().await.stop().await?;
         self.audio.lock().await.stop().await?;
 
+        // Close each display's open video segment now, so it is sealed at
+        // shutdown rather than at the next start.
+        let end_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        for encoder in self.video_encoders.lock().await.iter() {
+            if let Err(error) = encoder.lock().await.close_segment(end_ts) {
+                tracing::warn!("Video segment close failed: {error}");
+            }
+        }
+
         self.running = false;
         tracing::info!("Capture engine stopped");
         Ok(())
@@ -153,16 +163,29 @@ impl CaptureEngine {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
+                // Open video segments are closed and sealed on the wall clock,
+                // on every tick, also when this tick encodes nothing: a paused
+                // capture, frame capture switched off or a non-allowlisted app
+                // in front closes the segment at once, and an unchanged screen
+                // closes it after the idle window (see `segment_close_due`).
                 if crate::server::is_capture_paused() {
+                    close_due_video_segments(&video_encoders, false).await;
                     continue;
                 }
 
                 // Enumerate displays
                 let displays = screen.lock().await.get_displays();
+                // The foreground window is per desktop, not per display: read it
+                // once per tick.
+                let win_info = window.lock().await.get_active_window().await;
+                let recording = crate::server::is_frame_capture_enabled()
+                    && crate::server::is_capture_allowed(
+                        win_info.as_ref().map(|w| w.app_name.as_str()).unwrap_or(""),
+                    );
+                close_due_video_segments(&video_encoders, recording).await;
 
                 for disp in &displays {
                     let did = disp.id;
-                    let win_info = window.lock().await.get_active_window().await;
                     let frame_result = screen.lock().await.capture_frame(did).await;
 
                     match frame_result {
@@ -182,17 +205,25 @@ impl CaptureEngine {
 
                             // OCR + video encode — only when frame content changed
                             if changed {
-                                if let Some(ref worker) = ocr {
-                                    if let Ok(Some(text)) = worker
-                                        .process_frame(&frame.data, frame.width, frame.height)
-                                        .await
-                                    {
-                                        if !text.is_empty() {
-                                            let app = win_info
-                                                .as_ref()
-                                                .map(|w| w.app_name.as_str())
-                                                .unwrap_or("");
-                                            ingest_ocr_event(&text, app, frame.timestamp);
+                                let app_for_gate =
+                                    win_info.as_ref().map(|w| w.app_name.as_str()).unwrap_or("");
+                                // OCR is the most expensive step in this loop, and
+                                // its text lands in the event log, so it honours
+                                // the same per-app consent gate as keyframes: a
+                                // non-allowlisted app is neither read nor stored.
+                                if crate::server::is_capture_allowed(app_for_gate) {
+                                    if let Some(ref worker) = ocr {
+                                        if let Ok(Some(text)) = worker
+                                            .process_frame(&frame.data, frame.width, frame.height)
+                                            .await
+                                        {
+                                            if !text.is_empty() {
+                                                ingest_ocr_event(
+                                                    &text,
+                                                    app_for_gate,
+                                                    frame.timestamp,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -203,8 +234,6 @@ impl CaptureEngine {
                                 // screenshot while paused or for a non-allowlisted
                                 // app. (These checks live here, not just in the
                                 // /context/current response path.)
-                                let app_for_gate =
-                                    win_info.as_ref().map(|w| w.app_name.as_str()).unwrap_or("");
                                 let frames_ok = crate::server::is_frame_capture_enabled()
                                     && !crate::server::is_capture_paused()
                                     && crate::server::is_capture_allowed(app_for_gate);
@@ -278,6 +307,19 @@ impl CaptureEngine {
 
     pub fn is_running(&self) -> bool {
         self.running
+    }
+}
+
+/// Close (and seal) every open video segment that is due by wall-clock time.
+async fn close_due_video_segments(
+    encoders: &Mutex<Vec<Arc<Mutex<VideoEncoder>>>>,
+    recording: bool,
+) {
+    let now = wall_micros();
+    for encoder in encoders.lock().await.iter() {
+        if let Err(error) = encoder.lock().await.close_segment_if_due(now, recording) {
+            tracing::warn!("Video segment close failed: {error}");
+        }
     }
 }
 

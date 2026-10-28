@@ -1,6 +1,6 @@
 [package]
 name = "shadow"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -14,6 +14,7 @@ ghost-core = { path = "../../crates/ghost/core" }
 ghost-eyes = { path = "../../crates/ghost/eyes" }
 ghost-hands = { path = "../../crates/ghost/hands" }
 ghost-permissions = { path = "../../crates/ghost/permissions" }
+ryu-sidecar-runtime = { path = "../../crates/core/sidecar-runtime", features = ["peer-proof"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 axum = { version = "0.8", features = ["ws"] }
@@ -51,11 +52,16 @@ whisper-rs = { version = "0.11", optional = true }  # Whisper transcription
 
 # Video pipeline (optional - requires FFmpeg system libs)
 ffmpeg-next = { version = "7", optional = true }
+# Phase-2 content sealing (encb:v1 / RYU-CB01 / blind indexes). No OS keychain
+# backend: the key arrives from Core (RYU_SEAL_KEY) or RYU_MASTER_KEY.
+ryu-crypto = { path = "../../crates/core/crypto", version = "0.5.0", default-features = false, features = ["sqlite"] }
 
 [features]
 default = []
 full = ["ort", "whisper-rs"]
 video = ["ffmpeg-next"]
+# Explicit local hardware probe; excluded from ordinary unattended tests.
+permission-probe = []
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]

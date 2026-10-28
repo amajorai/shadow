@@ -34,7 +34,84 @@ pub struct AgentPattern {
 
 // ── PatternStore ─────────────────────────────────────────────────────────────
 
-/// Persists patterns as JSON files under `~/.shadow/data/patterns/`.
+/// Content store of the pattern files.
+const STORE: &str = "shadow-patterns";
+
+/// Read one pattern file: sealed (`encb:v1:`, bound to the pattern id) or a
+/// legacy plaintext file from an earlier build.
+fn read_pattern_file(path: &Path) -> Option<AgentPattern> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let id = path.file_stem()?.to_str()?;
+    let json = match shadow_core::seal::open_strict(STORE, "pattern.json", "id", id, &text) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!("shadow: a pattern file does not open: {error}");
+            return None;
+        }
+    };
+    serde_json::from_str(&json).ok()
+}
+
+/// Write one pattern sealed, through an owner-only temp file and a rename.
+/// Without a key nothing is written, except in compat mode (plaintext, as
+/// before sealing; sealed at the first start with a key).
+fn write_pattern_file(dir: &Path, pattern: &AgentPattern) {
+    let result = (|| -> anyhow::Result<()> {
+        let json = serde_json::to_string_pretty(pattern)?;
+        let sealed =
+            shadow_core::seal::seal_value(STORE, "pattern.json", "id", &pattern.id, &json)?;
+        let path = dir.join(format!("{}.json", pattern.id));
+        let temp = dir.join(format!("{}.json.tmp", pattern.id));
+        let _ = std::fs::remove_file(&temp);
+        {
+            use std::io::Write as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp)?;
+            file.write_all(sealed.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&temp, &path)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::warn!("shadow: pattern not saved: {error}");
+    }
+}
+
+/// Seal every plaintext pattern file an earlier build wrote (the sealed copy
+/// replaces it by rename only once written). Skipped without a key.
+fn reseal_legacy_files(dir: &Path) {
+    if !shadow_core::seal::is_sealing() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if ryu_crypto::looks_sealed(&text) {
+            continue;
+        }
+        if let Some(pattern) = read_pattern_file(&path) {
+            if path.file_stem().and_then(|stem| stem.to_str()) == Some(pattern.id.as_str()) {
+                write_pattern_file(dir, &pattern);
+            }
+        }
+    }
+}
+
+/// Persists patterns as sealed JSON files under `<shadow data dir>/data/patterns/`.
 pub struct PatternStore {
     dir: PathBuf,
     cache: Option<Vec<AgentPattern>>,
@@ -42,7 +119,10 @@ pub struct PatternStore {
 
 impl PatternStore {
     pub fn new(dir: &Path) -> Self {
-        std::fs::create_dir_all(dir).ok();
+        #[cfg(test)]
+        shadow_core::seal::install_fixed_key_for_tests();
+        shadow_core::seal::create_private_dir(dir).ok();
+        reseal_legacy_files(dir);
         Self {
             dir: dir.to_path_buf(),
             cache: None,
@@ -51,10 +131,7 @@ impl PatternStore {
 
     /// Save a pattern to disk, overwriting if the ID already exists.
     pub fn save(&mut self, pattern: &AgentPattern) {
-        let path = self.dir.join(format!("{}.json", pattern.id));
-        if let Ok(json) = serde_json::to_string_pretty(pattern) {
-            let _ = std::fs::write(path, json);
-        }
+        write_pattern_file(&self.dir, pattern);
         self.cache = None; // invalidate cache
     }
 
@@ -65,12 +142,10 @@ impl PatternStore {
             if let Ok(dir) = std::fs::read_dir(&self.dir) {
                 for entry in dir.flatten() {
                     if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
-                        if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                            if let Ok(p) = serde_json::from_str::<AgentPattern>(&text) {
-                                // Skip archived patterns (failure_count > success_count*2 + 2)
-                                if p.failure_count <= p.success_count * 2 + 2 {
-                                    patterns.push(p);
-                                }
+                        if let Some(p) = read_pattern_file(&entry.path()) {
+                            // Skip archived patterns (failure_count > success_count*2 + 2)
+                            if p.failure_count <= p.success_count * 2 + 2 {
+                                patterns.push(p);
                             }
                         }
                     }
@@ -118,19 +193,15 @@ impl PatternStore {
     /// Increment success or failure count and persist.
     pub fn record_outcome(&mut self, id: &str, success: bool) {
         let path = self.dir.join(format!("{}.json", id));
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if let Ok(mut p) = serde_json::from_str::<AgentPattern>(&text) {
-                if success {
-                    p.success_count += 1;
-                } else {
-                    p.failure_count += 1;
-                }
-                p.last_used = wall_micros();
-                if let Ok(json) = serde_json::to_string_pretty(&p) {
-                    let _ = std::fs::write(&path, json);
-                }
-                self.cache = None;
+        if let Some(mut p) = read_pattern_file(&path) {
+            if success {
+                p.success_count += 1;
+            } else {
+                p.failure_count += 1;
             }
+            p.last_used = wall_micros();
+            write_pattern_file(&self.dir, &p);
+            self.cache = None;
         }
     }
 
@@ -355,6 +426,35 @@ mod tests {
             created_at: 0,
             last_used: 0,
         }
+    }
+
+    #[test]
+    fn pattern_files_are_sealed_and_legacy_files_still_load() {
+        let dir = temp_dir();
+        let mut store = PatternStore::new(&dir);
+        store.save(&pattern(
+            "sealed",
+            "wire money to kestrel-bank",
+            Some("Bank"),
+        ));
+        let on_disk = std::fs::read_to_string(dir.join("sealed.json")).unwrap();
+        assert!(on_disk.starts_with("encb:v1:"));
+        assert!(!on_disk.contains("kestrel-bank"));
+        // A plaintext file written by an earlier build still loads.
+        let legacy = pattern("legacy", "plain old task", None);
+        std::fs::write(
+            dir.join("legacy.json"),
+            serde_json::to_string(&legacy).unwrap(),
+        )
+        .unwrap();
+        let mut store = PatternStore::new(&dir);
+        let ids: Vec<String> = store.load_all().iter().map(|p| p.id.clone()).collect();
+        assert!(ids.contains(&"sealed".to_string()));
+        assert!(ids.contains(&"legacy".to_string()));
+        // Opening the store sealed the legacy file in place.
+        let rewritten = std::fs::read_to_string(dir.join("legacy.json")).unwrap();
+        assert!(rewritten.starts_with("encb:v1:"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

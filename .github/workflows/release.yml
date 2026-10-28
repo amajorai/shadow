@@ -59,21 +59,48 @@ jobs:
         include:
           - os: ubuntu-22.04
             plat: linux-x86_64
+            triple: ''
             ext: tar.gz
           - os: macos-latest
             plat: macos-aarch64
+            triple: ''
+            ext: tar.gz
+          - os: macos-latest
+            plat: macos-x86_64
+            triple: x86_64-apple-darwin
             ext: tar.gz
           - os: windows-latest
             plat: windows-x86_64
+            triple: ''
             ext: zip
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Refuse to attach a binary built from a tree that is not the train tag's.
+      # This workflow builds the satellite's default branch, which only matches the
+      # tag after `tools/mirror-satellites.sh legacy` has run from that tag
+      # (mirror-releases.yml does both, in that order). A stale tree would publish
+      # the previous version under the new tag, and `releases/latest/download` would
+      # hand it to every Core.
+      - name: Verify the source is the train tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          have="$(sed -n 's/^version *= *"\(.*\)"/\1/p' apps/shadow/Cargo.toml | head -n 1)"
+          if [ "v$have" != "$TAG" ]; then
+            echo "::error::apps/shadow/Cargo.toml is version $have but the release tag is $TAG. Re-run tools/mirror-satellites.sh legacy from $TAG, then dispatch again."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.triple }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Must point at the manifest's own dir: with no root Cargo.toml the
           # action finds nothing at the repo root ("could not find Cargo.toml").
           workspaces: apps/shadow
+          key: ${{ matrix.plat }}
       # Established by enumerating the -sys crates in the Linux dep graph
       # (alsa-sys via cpal, openssl-sys, dbus, opus). Never guard with `|| true`:
       # a missing dep must fail loudly at build time.
@@ -84,22 +111,32 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install dbus pkg-config opus
       - name: Build
-        run: cargo build --release --manifest-path apps/shadow/Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.triple }}" ]; then
+            cargo build --release --manifest-path apps/shadow/Cargo.toml --target "${{ matrix.triple }}"
+          else
+            cargo build --release --manifest-path apps/shadow/Cargo.toml
+          fi
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
+          # A --target build lands under target/<triple>/release, not target/release.
+          target="apps/shadow/target/release"
+          if [ -n "${{ matrix.triple }}" ]; then target="apps/shadow/target/${{ matrix.triple }}/release"; fi
           out="dist/shadow-${{ matrix.plat }}.${{ matrix.ext }}"
           # The binary must land at the archive ROOT under its plain name —
           # Core's extract_from_tar_gz compares path.file_name() to "shadow"
           # exactly, and extract_from_zip matches a name ending "shadow.exe".
           case "${{ matrix.ext }}" in
             tar.gz)
-              tar -czf "$out" -C apps/shadow/target/release "shadow"
+              tar -czf "$out" -C "$target" "shadow"
               ;;
             zip)
-              powershell -NoProfile -Command "Compress-Archive -Path 'apps/shadow/target/release/shadow.exe' -DestinationPath '$out' -Force"
+              powershell -NoProfile -Command "Compress-Archive -Path '$target/shadow.exe' -DestinationPath '$out' -Force"
               ;;
           esac
           if [ ! -s "$out" ]; then

@@ -1,35 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Display information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DisplayInfo {
-    pub id: u32,
-    pub width: u32,
-    pub height: u32,
-    pub is_primary: bool,
-}
-
-/// Captured frame.
-#[derive(Debug, Clone)]
-pub struct Frame {
-    pub display_id: u32,
-    pub width: u32,
-    pub height: u32,
-    pub data: Vec<u8>, // BGRA format
-    pub timestamp: u64,
-}
-
-/// Screen capture trait — platform-specific implementations.
-#[async_trait]
-pub trait ScreenCapture: Send + Sync {
-    async fn start(&mut self) -> Result<()>;
-    async fn stop(&mut self) -> Result<()>;
-    fn get_displays(&self) -> Vec<DisplayInfo>;
-    async fn capture_frame(&self, display_id: u32) -> Result<Frame>;
-}
+// The display/frame types, the capture trait and the primary-display probe are
+// Ghost's, so frames from Ghost's one-shot capture need no conversion.
+pub use ghost_eyes::screen::{get_primary_display_size, DisplayInfo, Frame, ScreenCapture};
 
 // ─── Windows: DXGI Desktop Duplication ───────────────────────────────────────
 
@@ -330,22 +305,6 @@ pub use windows_impl::WindowsScreenCapture;
 // ─── macOS: CGDisplayCreateImage (CoreGraphics) ──────────────────────────────
 
 #[cfg(target_os = "macos")]
-mod macos_ffi {
-    use std::ffi::c_void;
-    // CoreGraphics is already linked by the core-graphics crate.
-    extern "C" {
-        pub fn CGDisplayCreateImage(displayID: u32) -> *const c_void;
-        pub fn CGImageGetWidth(image: *const c_void) -> usize;
-        pub fn CGImageGetHeight(image: *const c_void) -> usize;
-        pub fn CGImageGetDataProvider(image: *const c_void) -> *const c_void;
-        pub fn CGDataProviderCopyData(provider: *const c_void) -> *const c_void;
-        pub fn CFDataGetLength(data: *const c_void) -> isize;
-        pub fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
-        pub fn CFRelease(cf: *const c_void);
-    }
-}
-
-#[cfg(target_os = "macos")]
 pub struct MacOSScreenCapture {
     displays: Vec<DisplayInfo>,
 }
@@ -396,38 +355,12 @@ impl ScreenCapture for MacOSScreenCapture {
 
 #[cfg(target_os = "macos")]
 fn capture_macos(display_id: u32) -> Result<Frame> {
-    use macos_ffi::*;
-    unsafe {
-        let img = CGDisplayCreateImage(display_id);
-        if img.is_null() {
-            return Err(anyhow::anyhow!(
-                "CGDisplayCreateImage returned null for display {}",
-                display_id
-            ));
-        }
-        let w = CGImageGetWidth(img) as u32;
-        let h = CGImageGetHeight(img) as u32;
-        let provider = CGImageGetDataProvider(img);
-        let cf_data = CGDataProviderCopyData(provider);
-        if cf_data.is_null() {
-            CFRelease(img);
-            return Err(anyhow::anyhow!("CGDataProviderCopyData returned null"));
-        }
-        let len = CFDataGetLength(cf_data) as usize;
-        let data = std::slice::from_raw_parts(CFDataGetBytePtr(cf_data), len).to_vec();
-        CFRelease(cf_data);
-        CFRelease(img);
-        Ok(Frame {
-            display_id,
-            width: w,
-            height: h,
-            data, // native format: BGRA on macOS
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64,
-        })
-    }
+    // Reuse Ghost's modern capture path and permission gate. The removed
+    // CGDisplayCreateImage path can return null even after a grant on macOS 15+.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(ghost_eyes::screen::quick_screenshot(display_id))
 }
 
 // ─── Linux: X11 XGetImage ─────────────────────────────────────────────────────
@@ -664,45 +597,6 @@ fn quick_screenshot_sync(display_id: u32) -> Result<Frame> {
 #[cfg(target_os = "linux")]
 fn quick_screenshot_sync(display_id: u32) -> Result<Frame> {
     capture_linux(display_id)
-}
-
-/// Return (width, height) of the primary display using fast platform APIs.
-pub fn get_primary_display_size() -> (u32, u32) {
-    #[cfg(target_os = "windows")]
-    unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-        (
-            GetSystemMetrics(SM_CXSCREEN) as u32,
-            GetSystemMetrics(SM_CYSCREEN) as u32,
-        )
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use core_graphics::display::CGDisplay;
-        let d = CGDisplay::main();
-        (d.pixels_wide() as u32, d.pixels_high() as u32)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::ConnectionExt; // carries `get_geometry`
-        use x11rb::rust_connection::RustConnection;
-        if let Ok((conn, sn)) = RustConnection::connect(None) {
-            let screen = &conn.setup().roots[sn];
-            // Stepwise rather than `.and_then(|c| c.reply())`: the cookie is
-            // Result<_, ConnectionError> and reply() is Result<_, ReplyError>,
-            // and there is no From<ReplyError> for ConnectionError, so chaining
-            // them fails E0277. Splitting sidesteps the error unification.
-            if let Ok(cookie) = conn.get_geometry(screen.root) {
-                if let Ok(geom) = cookie.reply() {
-                    return (geom.width as u32, geom.height as u32);
-                }
-            }
-        }
-        (1920, 1080)
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    (1920, 1080)
 }
 
 // ─── Capture-source enumeration (for the clips source picker) ─────────────────

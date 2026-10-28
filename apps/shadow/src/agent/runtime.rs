@@ -11,17 +11,16 @@ use super::pattern::{PatternExtractor, PatternStore};
 use super::prompt_builder::AgentPromptBuilder;
 use super::tool_cache::ToolResultCache;
 use super::tools::ax::{
-    AXElementAtTool, AXFocusAppTool, AXHotkeyTool, AXInspectTool, AXListAppsTool, AXReadTextTool,
-    AXScrollTool, AXWaitTool, CaptureLiveScreenshotTool, ReplayProcedureTool,
+    AXElementAtTool, AXInspectTool, AXListAppsTool, AXReadTextTool, AXWaitTool,
+    CaptureLiveScreenshotTool,
 };
-use super::tools::memory::{GetDirectivesTool, GetKnowledgeTool, SetDirectiveTool};
+use super::tools::memory::{GetDirectivesTool, GetKnowledgeTool};
 use super::tools::search::{
     GetActivitySequenceTool, GetDaySummaryTool, InspectScreenshotsTool, ResolveLatestMeetingTool,
     SearchSummariesTool, SearchVisualMemoriesTool,
 };
 use super::tools::{
-    AXClickTool, AXTreeQueryTool, AXTypeTool, AgentTool, GetTimelineContextTool,
-    GetTranscriptWindowTool, SearchHybridTool,
+    AXTreeQueryTool, AgentTool, GetTimelineContextTool, GetTranscriptWindowTool, SearchHybridTool,
 };
 use crate::llm::{
     orchestrator::LlmOrchestrator, LlmMessage, LlmRequest, LlmResponse, ToolCall, ToolDefinition,
@@ -67,6 +66,15 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     pub fn new(orchestrator: Arc<LlmOrchestrator>) -> Self {
+        // The activity chat is read-only. Its context carries captured
+        // third-party content (OCR, transcripts, window titles, AX text), so a
+        // tool call can be attacker-steered. Input-producing AX tools
+        // (click/type/hotkey/scroll/focus) are deliberately NOT registered;
+        // on-screen actions go through the bounded computer-use path instead.
+        // Nor are `set_directive` (it would let injected screen text persist an
+        // instruction that later turns replay) or the `replay_procedure` stub
+        // (it queued nothing). Directives are created through the authenticated
+        // HTTP API only.
         let tools: Vec<Arc<dyn AgentTool>> = vec![
             // Search tools
             Arc::new(SearchHybridTool),
@@ -78,23 +86,16 @@ impl AgentRuntime {
             Arc::new(SearchSummariesTool),
             Arc::new(SearchVisualMemoriesTool),
             Arc::new(InspectScreenshotsTool),
-            // AX tools
-            Arc::new(AXClickTool),
-            Arc::new(AXTypeTool),
+            // Read-only AX tools
             Arc::new(AXTreeQueryTool),
-            Arc::new(AXHotkeyTool),
-            Arc::new(AXScrollTool),
             Arc::new(AXWaitTool),
-            Arc::new(AXFocusAppTool),
             Arc::new(AXReadTextTool),
             Arc::new(AXInspectTool),
             Arc::new(AXElementAtTool),
             Arc::new(AXListAppsTool),
             Arc::new(CaptureLiveScreenshotTool),
-            Arc::new(ReplayProcedureTool),
             // Memory tools
             Arc::new(GetKnowledgeTool),
-            Arc::new(SetDirectiveTool),
             Arc::new(GetDirectivesTool),
         ];
         Self {
@@ -384,5 +385,90 @@ fn truncate_str(s: &str, max_chars: usize) -> &str {
         s
     } else {
         &s[..max_chars]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LlmConfig;
+    use serde_json::json;
+
+    /// AX tools that synthesize real keyboard/mouse input or move window focus.
+    const INPUT_PRODUCING_TOOLS: &[&str] = &[
+        "ax_click",
+        "ax_type",
+        "ax_hotkey",
+        "ax_scroll",
+        "ax_focus_app",
+        "replay_procedure",
+    ];
+
+    /// Tools that would let the chat write durable state from captured content.
+    const STATE_WRITING_TOOLS: &[&str] = &["set_directive"];
+
+    /// Remote-style config: no Ollama probe is spawned, so this is hermetic.
+    fn runtime() -> AgentRuntime {
+        let orchestrator = LlmOrchestrator::new(&LlmConfig {
+            base_url: "http://example.invalid/v1".to_string(),
+            model: "test-model".to_string(),
+            api_key: "sk-test".to_string(),
+        });
+        AgentRuntime::new(Arc::new(orchestrator))
+    }
+
+    #[test]
+    fn activity_chat_offers_no_input_producing_tools() {
+        let names: Vec<String> = runtime()
+            .tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        for tool in INPUT_PRODUCING_TOOLS {
+            assert!(
+                !names.iter().any(|name| name == tool),
+                "activity chat must not offer the input-producing tool `{tool}`"
+            );
+        }
+        for tool in STATE_WRITING_TOOLS {
+            assert!(
+                !names.iter().any(|name| name == tool),
+                "activity chat must not offer the state-writing tool `{tool}`"
+            );
+        }
+        // Read-only lookups stay available.
+        for tool in [
+            "search_hybrid",
+            "get_transcript_window",
+            "ax_read_text",
+            "get_directives",
+        ] {
+            assert!(names.iter().any(|name| name == tool), "missing `{tool}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_chat_refuses_injected_input_tool_calls() {
+        // Arguments are deliberately empty so that, even if a regression
+        // re-registered these tools, the test would not synthesize real input.
+        let runtime = runtime();
+        for (name, arguments) in [
+            ("ax_type", json!({ "text": "", "press_enter": false })),
+            ("ax_hotkey", json!({ "keys": "" })),
+        ] {
+            let call = ToolCall {
+                id: "call-1".to_string(),
+                name: name.to_string(),
+                arguments,
+            };
+            let error = runtime
+                .execute_tool(&call)
+                .await
+                .expect_err("an injected input tool call must be refused");
+            assert!(
+                error.to_string().contains("Unknown tool"),
+                "unexpected refusal for `{name}`: {error}"
+            );
+        }
     }
 }

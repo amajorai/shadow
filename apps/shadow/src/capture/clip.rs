@@ -267,7 +267,6 @@ pub struct ClipRecorder {
     clip_id: String,
     t0_epoch_ms: i64,
     dir: PathBuf,
-    fps: u32,
     running: Arc<AtomicBool>,
     /// True while the clip is paused: capture is suspended and the paused span is
     /// excluded from the final duration. Watched by the screen thread.
@@ -297,21 +296,27 @@ fn slot() -> &'static Mutex<Option<ClipRecorder>> {
     CLIP.get_or_init(|| Mutex::new(None))
 }
 
+/// Serializes read-modify-write of a clip's `diagnostics.json` and
+/// `agent-context.json`. Each write is atomic (see [`write_doc`]), but two
+/// overlapping diagnostics flushes would otherwise read the same document and
+/// the later rename would drop the other's events, and a flush racing `stop`
+/// could rewrite the finalized manifest with a stale duration. Held only for
+/// local file I/O, never across ffmpeg or network work.
+static BUNDLE_DOCS: Mutex<()> = Mutex::new(());
+
+fn lock_bundle_docs() -> std::sync::MutexGuard<'static, ()> {
+    BUNDLE_DOCS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // ─── Paths ──────────────────────────────────────────────────────────────────────
 
-/// The Shadow data root: `SHADOW_DATA_DIR` if set, else `~/.shadow` (mirrors
-/// `crates/shadow-core/src/config.rs`). Everything a clip writes lives under
+/// The Shadow data root: `SHADOW_DATA_DIR` if set, else the Ryu data dir's
+/// `services/shadow` (see [`crate::paths`]). Everything a clip writes lives under
 /// `<root>/media/clips/<id>/`.
 pub fn data_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("SHADOW_DATA_DIR") {
-        let trimmed = dir.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".shadow")
+    crate::paths::data_dir()
 }
 
 fn clips_root() -> PathBuf {
@@ -384,9 +389,54 @@ pub fn current_clip_id() -> Option<String> {
         .and_then(|g| g.as_ref().map(|r| r.clip_id.clone()))
 }
 
+/// Requested audio is mandatory; an unavailable optional source is never opened.
+fn prepare_audio_source<T, B>(
+    requested: bool,
+    label: &str,
+    build: impl FnOnce() -> anyhow::Result<(T, B)>,
+) -> anyhow::Result<(Option<T>, Option<B>)> {
+    if !requested {
+        return Ok((None, None));
+    }
+    let (stream, buffer) = build().map_err(|error| {
+        anyhow::anyhow!("{label} capture could not start. Check capture-device access and your system privacy settings, then try again: {error}")
+    })?;
+    Ok((Some(stream), Some(buffer)))
+}
+
 /// Start a new clip. Tears down any prior recording first (like the meeting
 /// recorder). Returns the initial manifest (durationMs 0).
 pub fn start(opts: ClipStartOpts) -> anyhow::Result<ClipContext> {
+    // Validate the requested sources before replacing a working recording or
+    // writing its manifest. A permission denial must never become a silent clip.
+    if opts.screen {
+        let app = crate::capture_engine::get_latest_ocr()
+            .map(|(_, app, _)| app)
+            .unwrap_or_default();
+        if !crate::server::is_frame_capture_enabled()
+            || crate::server::is_capture_paused()
+            || !crate::server::is_capture_allowed(&app)
+        {
+            anyhow::bail!("Screen capture is disabled or paused in Shadow capture settings.");
+        }
+        if !ghost_permissions::screen_recording_granted() {
+            anyhow::bail!("Screen Recording access is unavailable. On macOS, enable Ryu in Privacy & Security > Screen Recording and restart Ryu. On Linux, use an X11 session; the native recorder does not support Wayland portals.");
+        }
+        let (display_id, _) = resolve_capture_display(&opts);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime
+            .block_on(crate::capture::screen::quick_screenshot(display_id))
+            .map_err(|error| anyhow::anyhow!("Screen capture could not start: {error}"))?;
+    }
+    let host = cpal::default_host();
+    let (mic_stream, mic_buf) =
+        prepare_audio_source(opts.mic, "Microphone", || build_mic_stream(&host))?;
+    let (sys_stream, sys_buf) = prepare_audio_source(opts.system_audio, "System audio", || {
+        build_loopback_stream(&host)
+    })?;
+
     // Discard any prior in-progress clip without muxing it — start replaces.
     if let Ok(mut guard) = slot().lock() {
         if let Some(mut prev) = guard.take() {
@@ -512,38 +562,10 @@ pub fn start(opts: ClipStartOpts) -> anyhow::Result<ClipContext> {
         None
     };
 
-    // ── Audio (best-effort) ──────────────────────────────────────────────────
-    let host = cpal::default_host();
-    let (mic_stream, mic_buf) = if opts.mic {
-        match build_mic_stream(&host) {
-            Ok((stream, buf)) => (Some(stream), Some(buf)),
-            Err(e) => {
-                tracing::warn!("clip: microphone capture unavailable ({e}); recording without mic");
-                (None, None)
-            }
-        }
-    } else {
-        (None, None)
-    };
-    let (sys_stream, sys_buf) = if opts.system_audio {
-        match build_loopback_stream(&host) {
-            Ok((stream, buf)) => (Some(stream), Some(buf)),
-            Err(e) => {
-                tracing::warn!(
-                    "clip: system-audio loopback unavailable ({e}); recording without it"
-                );
-                (None, None)
-            }
-        }
-    } else {
-        (None, None)
-    };
-
     let recorder = ClipRecorder {
         clip_id,
         t0_epoch_ms,
         dir,
-        fps,
         running,
         paused,
         paused_accum_ms,
@@ -697,6 +719,13 @@ pub fn stop() -> anyhow::Result<Option<ClipContext>> {
 
     let id = recorder.clip_id.clone();
     let frames = recorder.frame_count.load(Ordering::Relaxed);
+    // Stop time excludes encoding/transcription work. Slow OS screen captures
+    // can produce fewer frames than the requested rate; preserve their real span
+    // instead of speeding up the video and truncating the audio with -shortest.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let paused_ms = total_paused_ms(&recorder, now_ms);
+    let duration_ms =
+        (now_ms.saturating_sub(recorder.t0_epoch_ms).max(0) as u64).saturating_sub(paused_ms);
 
     // Build the mixed 16 kHz mono WAV (if any audio was captured) and persist it
     // next to the frames so ffmpeg can mux it.
@@ -704,9 +733,14 @@ pub fn stop() -> anyhow::Result<Option<ClipContext>> {
     let has_audio = write_mixed_wav(&mic, &sys, &audio_wav_path);
 
     // Mux frames (+ audio) → clip.mp4. Leave the frame sequence as a fallback on
-    // failure so the bundle is never empty.
+    // failure so the bundle is never empty; a failed mux leaves no clip.mp4, so
+    // `/clips/{id}/file` 404s and `extract_frame` serves the seq frames.
     if frames > 0 {
-        if let Err(e) = mux_clip(&recorder.dir, recorder.fps, has_audio) {
+        if let Err(e) = mux_clip(
+            &recorder.dir,
+            recording_frame_rate(frames, duration_ms),
+            has_audio,
+        ) {
             tracing::warn!("clip {id}: ffmpeg mux failed ({e}); keeping frame sequence");
         }
     }
@@ -725,11 +759,8 @@ pub fn stop() -> anyhow::Result<Option<ClipContext>> {
 
     // Finalize the manifest: real duration + recommended moments from whatever
     // diagnostics arrived during the recording.
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let paused_ms = total_paused_ms(&recorder, now_ms);
-    let duration_ms =
-        (now_ms.saturating_sub(recorder.t0_epoch_ms).max(0) as u64).saturating_sub(paused_ms);
 
+    let _bundle_docs = lock_bundle_docs();
     let mut context = read_context(&id).unwrap_or_else(|_| ClipContext {
         id: id.clone(),
         title: recorder
@@ -765,7 +796,11 @@ pub fn read_context(id: &str) -> anyhow::Result<ClipContext> {
     if !is_valid_clip_id(id) {
         anyhow::bail!("invalid clip id");
     }
-    let bytes = std::fs::read(context_path(id))?;
+    read_context_file(&context_path(id))
+}
+
+fn read_context_file(path: &std::path::Path) -> anyhow::Result<ClipContext> {
+    let bytes = std::fs::read(path)?;
     let ctx: ClipContext = serde_json::from_slice(&bytes)?;
     Ok(ctx)
 }
@@ -803,22 +838,75 @@ pub fn append_diagnostics(id: &str, events: Vec<DiagnosticEvent>) -> anyhow::Res
     if !is_valid_clip_id(id) {
         anyhow::bail!("invalid clip id");
     }
-    let path = diagnostics_path(id);
-    let mut doc: DiagnosticsDoc = match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => DiagnosticsDoc::default(),
-    };
+    append_diagnostics_at(&diagnostics_path(id), &context_path(id), events)
+}
+
+/// [`append_diagnostics`] against explicit bundle paths, under the bundle lock so
+/// concurrent flushes for one clip never lose each other's events.
+fn append_diagnostics_at(
+    diagnostics: &std::path::Path,
+    context: &std::path::Path,
+    events: Vec<DiagnosticEvent>,
+) -> anyhow::Result<usize> {
+    let _bundle_docs = lock_bundle_docs();
+    let mut doc = load_diagnostics_for_append(diagnostics)?;
     doc.events.extend(events);
     let count = doc.events.len();
-    write_doc(&path, &doc)?;
+    write_doc(diagnostics, &doc)?;
 
     // Recompute recommended moments into the manifest (best-effort).
-    if let Ok(mut ctx) = read_context(id) {
+    if let Ok(mut ctx) = read_context_file(context) {
         ctx.recommended_moments = recommended_from_events(&doc.events);
-        let _ = write_doc(&context_path(id), &ctx);
+        let _ = write_doc(context, &ctx);
     }
 
     Ok(count)
+}
+
+/// Load a clip's `diagnostics.json` before an append. A missing file starts an
+/// empty document. A file that no longer parses (e.g. one truncated by a crash
+/// before writes were atomic) is moved aside to
+/// `diagnostics.corrupt-<unix_ms>.json` instead of being overwritten, so its
+/// earlier events stay on disk and later flushes keep appending to a fresh
+/// document rather than failing forever.
+fn load_diagnostics_for_append(path: &std::path::Path) -> anyhow::Result<DiagnosticsDoc> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DiagnosticsDoc::default());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("reading {}", path.display())));
+        }
+    };
+    let parse_error = match serde_json::from_slice::<DiagnosticsDoc>(&bytes) {
+        Ok(doc) => return Ok(doc),
+        Err(e) => e,
+    };
+
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "diagnostics".to_string());
+    let quarantine = path.with_file_name(format!(
+        "{stem}.corrupt-{}.json",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    tracing::warn!(
+        "clip diagnostics {} are unreadable ({parse_error}); moving them to {} and starting fresh",
+        path.display(),
+        quarantine.display()
+    );
+    match std::fs::rename(path, &quarantine) {
+        Ok(()) => Ok(DiagnosticsDoc::default()),
+        // Already gone (removed outside this process since the read).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DiagnosticsDoc::default()),
+        // Never overwrite events we could not preserve.
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "preserving unreadable diagnostics {}",
+            path.display()
+        ))),
+    }
 }
 
 /// Extract a single frame at `at_ms` as a JPEG, returning its path. Serves from
@@ -1002,6 +1090,9 @@ fn normalize_to_mp4(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Re
         .map(|e| e.eq_ignore_ascii_case("mp4"))
         .unwrap_or(false);
 
+    // Encode to a partial sibling and rename on success (see `mux_clip`).
+    let partial = partial_mp4_path(dest);
+
     if is_mp4 {
         let copied = std::process::Command::new("ffmpeg")
             .args([
@@ -1010,18 +1101,18 @@ fn normalize_to_mp4(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Re
                 src.to_str().unwrap_or(""),
                 "-c",
                 "copy",
-                dest.to_str().unwrap_or(""),
+                partial.to_str().unwrap_or(""),
             ])
             .output();
         if let Ok(out) = copied {
-            if out.status.success() && dest.exists() {
-                return Ok(());
+            if out.status.success() && partial.exists() {
+                return publish_partial_mp4(&partial, dest);
             }
         }
         // Fall through to a full re-encode if the copy failed (e.g. odd codec).
     }
 
-    let output = std::process::Command::new("ffmpeg")
+    let output = match std::process::Command::new("ffmpeg")
         .args([
             "-y",
             "-i",
@@ -1032,15 +1123,22 @@ fn normalize_to_mp4(src: &std::path::Path, dest: &std::path::Path) -> anyhow::Re
             "yuv420p",
             "-c:a",
             "aac",
-            dest.to_str().unwrap_or(""),
+            partial.to_str().unwrap_or(""),
         ])
         .output()
-        .map_err(|e| anyhow::anyhow!("ffmpeg not found: {e}"))?;
+    {
+        Ok(output) => output,
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            anyhow::bail!("ffmpeg not found: {e}");
+        }
+    };
     if !output.status.success() {
+        let _ = std::fs::remove_file(&partial);
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("ffmpeg normalize failed: {stderr}");
     }
-    Ok(())
+    publish_partial_mp4(&partial, dest)
 }
 
 /// Probe the clip duration in ms. Prefers `ffprobe format=duration`; falls back
@@ -1148,12 +1246,40 @@ fn extract_audio_wav(mp4: &std::path::Path, dest: &std::path::Path) -> anyhow::R
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────
 
+/// Atomically replace `path` with `doc` as pretty JSON: write a uniquely named
+/// sibling temp file, fsync it, then rename it over the target (the temp+rename
+/// pattern from `config.rs`). A crash mid-write therefore never leaves a
+/// truncated manifest or diagnostics file, and overlapping writers (concurrent
+/// diagnostics flushes for one clip) never share a temp file.
 fn write_doc<T: Serialize>(path: &std::path::Path, doc: &T) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
+    use std::io::Write as _;
+
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
         std::fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(doc)?;
-    std::fs::write(path, bytes)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("document path {} has no file name", path.display()))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(&bytes)?;
+        file.sync_all()
+    });
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context(format!("writing {}", path.display())));
+    }
+    // Persist the rename itself; best-effort because the data is already synced.
+    #[cfg(unix)]
+    if let Some(dir) = parent.and_then(|p| std::fs::File::open(p).ok()) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -1339,10 +1465,15 @@ fn write_mixed_wav(
 /// Mux the JPEG frame sequence (+ optional audio) into `clip.mp4` via the ffmpeg
 /// CLI (same shell-out pattern as `video::FrameExtractor`, not the `video` cargo
 /// feature).
-fn mux_clip(dir: &std::path::Path, fps: u32, has_audio: bool) -> anyhow::Result<()> {
+fn recording_frame_rate(frames: usize, duration_ms: u64) -> f64 {
+    frames.max(1) as f64 * 1000.0 / duration_ms.max(1) as f64
+}
+
+fn mux_clip(dir: &std::path::Path, fps: f64, has_audio: bool) -> anyhow::Result<()> {
     let frames_pattern = dir.join("frames").join("seq-%06d.jpg");
     let audio = dir.join("audio.wav");
     let out = dir.join("clip.mp4");
+    let partial = partial_mp4_path(&out);
 
     let mut args: Vec<String> = vec![
         "-y".into(),
@@ -1364,16 +1495,37 @@ fn mux_clip(dir: &std::path::Path, fps: u32, has_audio: bool) -> anyhow::Result<
         args.push("aac".into());
         args.push("-shortest".into());
     }
-    args.push(out.to_string_lossy().to_string());
+    args.push(partial.to_string_lossy().to_string());
 
-    let output = std::process::Command::new("ffmpeg")
-        .args(&args)
-        .output()
-        .map_err(|e| anyhow::anyhow!("ffmpeg not found: {e}"))?;
+    let output = match std::process::Command::new("ffmpeg").args(&args).output() {
+        Ok(output) => output,
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            anyhow::bail!("ffmpeg not found: {e}");
+        }
+    };
 
     if !output.status.success() {
+        let _ = std::fs::remove_file(&partial);
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("ffmpeg mux failed: {stderr}");
+    }
+    publish_partial_mp4(&partial, &out)
+}
+
+/// The sibling ffmpeg writes to before the result is renamed onto `dest`
+/// (`clip.mp4` → `clip.partial.mp4`). The `.mp4` suffix lets ffmpeg still infer
+/// the muxer. A failed or interrupted encode therefore never leaves a moov-less
+/// file at the canonical path that `/clips/{id}/file` would serve.
+fn partial_mp4_path(dest: &std::path::Path) -> PathBuf {
+    dest.with_extension("partial.mp4")
+}
+
+/// Rename a finished partial MP4 onto `dest`, removing it if the rename fails.
+fn publish_partial_mp4(partial: &std::path::Path, dest: &std::path::Path) -> anyhow::Result<()> {
+    if let Err(e) = std::fs::rename(partial, dest) {
+        let _ = std::fs::remove_file(partial);
+        return Err(anyhow::Error::new(e).context(format!("publishing {}", dest.display())));
     }
     Ok(())
 }
@@ -1508,10 +1660,15 @@ fn core_transcribe_url(engine: Option<&str>) -> Result<String, String> {
 /// Recompute recommended moments from the on-disk diagnostics.
 fn recommended_from_disk(id: &str) -> Vec<RecommendedMoment> {
     match std::fs::read(diagnostics_path(id)) {
-        Ok(bytes) => {
-            let doc: DiagnosticsDoc = serde_json::from_slice(&bytes).unwrap_or_default();
-            recommended_from_events(&doc.events)
-        }
+        Ok(bytes) => match serde_json::from_slice::<DiagnosticsDoc>(&bytes) {
+            Ok(doc) => recommended_from_events(&doc.events),
+            Err(e) => {
+                tracing::warn!(
+                    "clip {id}: diagnostics are unreadable ({e}); no recommended moments"
+                );
+                Vec::new()
+            }
+        },
         Err(_) => Vec::new(),
     }
 }
@@ -1583,6 +1740,99 @@ fn nearest_seq_frame(id: &str, at_ms: u64) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "permission-probe")]
+    #[test]
+    fn live_screen_and_microphone_recording_produces_a_playable_clip() {
+        let root = std::env::var("SHADOW_DATA_DIR")
+            .expect("the hardware probe requires an isolated SHADOW_DATA_DIR");
+        assert!(root.starts_with("/tmp/ryu-permissions-"));
+        let initial = start(ClipStartOpts {
+            screen: true,
+            mic: true,
+            system_audio: false,
+            display_id: None,
+            title: Some("Permission verification".into()),
+            tab: None,
+            target: None,
+        })
+        .expect("actual screen and microphone capture must start");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let finished = stop()
+            .expect("actual recording must stop and mux")
+            .expect("an active clip must finish");
+        assert_eq!(finished.id, initial.id);
+        assert!(finished.duration_ms >= 2000);
+        assert!(!is_recording());
+        let dir = clip_dir(&finished.id);
+        assert!(std::fs::metadata(dir.join("audio.wav")).unwrap().len() > 44);
+        assert!(std::fs::metadata(dir.join("clip.mp4")).unwrap().len() > 0);
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(dir.join("clip.mp4"))
+            .output()
+            .expect("ffprobe must inspect the recorded artifact");
+        assert!(probe.status.success());
+        let streams = String::from_utf8(probe.stdout).unwrap();
+        assert!(streams.contains("video"));
+        assert!(streams.contains("audio"));
+        let duration = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(dir.join("clip.mp4"))
+            .output()
+            .unwrap();
+        assert!(duration.status.success());
+        let media_seconds: f64 = String::from_utf8(duration.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            (media_seconds - finished.duration_ms as f64 / 1000.0).abs() < 0.5,
+            "media duration {media_seconds} must match the recorded span {}ms",
+            finished.duration_ms
+        );
+
+        println!("Live permission probe artifact: {}", dir.display());
+    }
+
+    #[test]
+    fn slow_capture_preserves_the_recording_span() {
+        assert_eq!(recording_frame_rate(1, 5000), 0.2);
+        assert_eq!(recording_frame_rate(10, 5000), 2.0);
+        assert!(recording_frame_rate(0, 0).is_finite());
+    }
+
+    #[test]
+    fn requested_audio_denial_is_an_error_and_unused_sources_are_not_opened() {
+        let denied = prepare_audio_source::<(), ()>(true, "Microphone", || {
+            anyhow::bail!("permission denied")
+        });
+        let message = denied.unwrap_err().to_string();
+        assert!(message.contains("Microphone capture could not start"));
+        assert!(message.contains("permission denied"));
+        let unused = prepare_audio_source::<(), ()>(false, "Microphone", || {
+            panic!("an unrequested source must not be opened")
+        })
+        .unwrap();
+        assert_eq!(unused, (None, None));
+        let ready = prepare_audio_source(true, "System audio", || Ok((42, 7))).unwrap();
+        assert_eq!(ready, (Some(42), Some(7)));
+    }
+
     #[test]
     fn valid_clip_ids_pass() {
         // The shapes `start`/`ingest` actually mint.
@@ -1616,6 +1866,153 @@ mod tests {
         assert!(read_context("../../..").is_err());
         assert!(append_diagnostics("../../..", Vec::new()).is_err());
         assert!(extract_frame("../../..", 0).is_err());
+    }
+
+    /// A unique scratch dir under the OS temp dir (never `SHADOW_DATA_DIR`).
+    fn scratch_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shadow-clip-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn file_names(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn console_errors(texts: &[&str]) -> DiagnosticsDoc {
+        DiagnosticsDoc {
+            events: texts
+                .iter()
+                .zip(0_i64..)
+                .map(|(text, t)| DiagnosticEvent {
+                    t,
+                    kind: "console".into(),
+                    level: Some("error".into()),
+                    text: Some((*text).into()),
+                    url: None,
+                    method: None,
+                    status: None,
+                    source: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn write_doc_replaces_atomically_and_leaves_no_temp() {
+        let dir = scratch_dir();
+        let path = dir.join("diagnostics.json");
+        write_doc(&path, &console_errors(&["first"])).unwrap();
+        let second = console_errors(&["second", "third"]);
+        write_doc(&path, &second).unwrap();
+
+        let back: DiagnosticsDoc = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&back).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        let names = file_names(&dir);
+        assert_eq!(names, vec!["diagnostics.json".to_string()], "{names:?}");
+        assert!(!names.iter().any(|name| name.ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_diagnostics_are_quarantined_not_wiped() {
+        let dir = scratch_dir();
+        let path = dir.join("diagnostics.json");
+        let corrupt = br#"{"events":[{"t":1,"#;
+        std::fs::write(&path, corrupt).unwrap();
+
+        let doc = load_diagnostics_for_append(&path).unwrap();
+        assert!(doc.events.is_empty());
+        let quarantined: Vec<String> = file_names(&dir)
+            .into_iter()
+            .filter(|name| name.starts_with("diagnostics.corrupt-") && name.ends_with(".json"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(std::fs::read(dir.join(&quarantined[0])).unwrap(), corrupt);
+        assert!(
+            std::fs::read(&path).map_or(true, |bytes| bytes != corrupt),
+            "the corrupt bytes must not stay at the canonical path"
+        );
+
+        // Later appends write a fresh document next to the preserved one.
+        write_doc(&path, &console_errors(&["after"])).unwrap();
+        assert_eq!(load_diagnostics_for_append(&path).unwrap().events.len(), 1);
+        assert_eq!(std::fs::read(dir.join(&quarantined[0])).unwrap(), corrupt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_diagnostics_start_empty() {
+        let dir = scratch_dir();
+        let doc = load_diagnostics_for_append(&dir.join("diagnostics.json")).unwrap();
+        assert!(doc.events.is_empty());
+        assert!(file_names(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_diagnostics_appends_keep_every_event() {
+        const WRITERS: usize = 6;
+        const FLUSHES: usize = 15;
+        let dir = scratch_dir();
+        let diagnostics = dir.join("diagnostics.json");
+        // No manifest: the best-effort recommended-moments refresh is skipped.
+        let context = dir.join("agent-context.json");
+
+        std::thread::scope(|scope| {
+            for _ in 0..WRITERS {
+                scope.spawn(|| {
+                    for _ in 0..FLUSHES {
+                        append_diagnostics_at(
+                            &diagnostics,
+                            &context,
+                            console_errors(&["flush"]).events,
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+
+        let doc = load_diagnostics_for_append(&diagnostics).unwrap();
+        assert_eq!(doc.events.len(), WRITERS * FLUSHES);
+        assert_eq!(file_names(&dir), vec!["diagnostics.json".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_mux_leaves_no_canonical_or_partial_mp4() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(dir.join("frames")).unwrap();
+        std::fs::write(dir.join("frames").join("seq-000001.jpg"), b"not a jpeg").unwrap();
+        // A stale partial from an interrupted encode is cleared as well.
+        std::fs::write(dir.join("clip.partial.mp4"), b"stale").unwrap();
+
+        // Fails whether ffmpeg is missing (spawn error) or rejects the frames
+        // (it truncates its output before exiting non-zero).
+        assert!(mux_clip(&dir, 1.0, false).is_err());
+        assert!(!dir.join("clip.mp4").exists());
+        assert!(!dir.join("clip.partial.mp4").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_mp4_keeps_the_mp4_suffix() {
+        let dest = std::path::Path::new("/clips/clip_abc/clip.mp4");
+        assert_eq!(
+            partial_mp4_path(dest),
+            PathBuf::from("/clips/clip_abc/clip.partial.mp4")
+        );
     }
 
     #[test]

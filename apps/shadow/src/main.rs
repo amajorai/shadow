@@ -7,6 +7,8 @@ mod llm;
 mod memory;
 mod mimicry;
 mod ocr;
+mod paths;
+mod sealed_db;
 mod server;
 mod speech_history;
 mod utils;
@@ -17,7 +19,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "shadow")]
+#[command(name = "shadow", version)]
 #[command(about = "Personal intelligence engine", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -52,8 +54,48 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Sealing key first, before any thread starts: take a Core-delivered subkey
+    // (RYU_SEAL_KEY) out of the environment, resolve Shadow's key (else from
+    // RYU_MASTER_KEY), then drop every key variable so no child Shadow spawns
+    // (ffmpeg, shell hooks, helpers) inherits one.
+    let delivery = ryu_crypto::capture_process_seal_key();
+    // Compat mode is allowed only for a Shadow that Core started and gave no
+    // key (a Core from before Shadow's sealing); a malformed delivery is not.
+    shadow_core::seal::set_started_by_core(
+        matches!(delivery, Ok(false)) && shadow_core::seal::core_launch_env_present(),
+    );
+    shadow_core::seal::resolve_process_key();
+    for name in ryu_crypto::SEAL_ENV_VARS {
+        std::env::remove_var(name);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main(delivery.err()))
+}
+
+/// Whether nothing is listening on Shadow's loopback `port`, i.e. no other Shadow
+/// holds this data dir. Best effort: a probe bind that races a starting server is
+/// still caught by the real bind later.
+fn server_port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Clear the plaintext scratch dir (copies of sealed media a crash left behind)
+/// and point raw macOS capture frames at it, never the system temp dir; frames
+/// earlier builds left in temp are deleted.
+fn prepare_scratch_dir() {
+    let _ = std::fs::remove_dir_all(paths::tmp_dir());
+    match ghost_eyes::capture_scratch::set_scratch_dir(paths::tmp_dir()) {
+        Ok(()) => {
+            ghost_eyes::capture_scratch::remove_legacy_temp_captures();
+        }
+        Err(error) => tracing::warn!("shadow: could not prepare the capture scratch dir: {error}"),
+    }
+}
+
+async fn async_main(seal_delivery_error: Option<anyhow::Error>) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -61,6 +103,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    if let Some(error) = seal_delivery_error {
+        tracing::warn!("shadow: ignoring a malformed sealing key delivery: {error}");
+    }
+    tracing::info!("Sealing: {}", shadow_core::seal::state().as_str());
     let cli = Cli::parse();
 
     match cli.command {
@@ -70,6 +116,18 @@ async fn main() -> anyhow::Result<()> {
             llm_model,
             llm_api_key,
         } => {
+            // Only `start` owns the private scratch dir. A CLI run (`stop`,
+            // `status`, `search`) or a second `start` that loses the port to a
+            // live server must not delete that server's in-flight files (the
+            // decrypted segment ffmpeg is reading, the OCR input, a capture frame).
+            if server_port_is_free(port) {
+                prepare_scratch_dir();
+            } else {
+                tracing::warn!(
+                    "Port {port} is already in use; leaving the scratch directory to the running Shadow"
+                );
+            }
+
             let mut config = config::Config::new();
             config.port = port;
 
@@ -105,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
 
             // 3a. Download Whisper model if not present (non-fatal)
             {
-                let mgr = intelligence::ModelManager::new(&config.data_dir);
+                let mgr = intelligence::ModelManager::new(&paths::models_dir());
                 if !mgr.is_available(&intelligence::WHISPER_TINY_MODEL) {
                     let mgr2 = mgr; // move into async block
                     tokio::spawn(async move {
@@ -297,41 +355,25 @@ async fn main() -> anyhow::Result<()> {
             });
             tracing::info!("✓ Full-text search indexer started");
 
-            // 9.7. Prune old screen keyframes by age. Direct JPEG keyframes (the
-            // out-of-the-box timeline frames) have no backing MP4 segment, so the
-            // segment-keyed retention sweep never touches them — they would grow
-            // unbounded on disk. Delete keyframes older than the total retention
-            // window (hot + warm days) once on startup, then daily.
-            {
-                tokio::spawn(async move {
-                    loop {
-                        let retain_days = shadow_core::get_history_retention_days()
-                            .unwrap_or_else(|_| shadow_core::default_history_retention_days())
-                            as u64;
-                        let now_us = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as u64)
-                            .unwrap_or(0);
-                        let cutoff = now_us.saturating_sub(retain_days * 86_400 * 1_000_000);
-                        match tokio::task::spawn_blocking(move || {
-                            shadow_core::prune_keyframes_before(cutoff)
-                        })
-                        .await
-                        {
-                            Ok(Ok(paths)) if !paths.is_empty() => {
-                                for p in &paths {
-                                    let _ = std::fs::remove_file(p);
-                                }
-                                tracing::info!("Keyframe retention: pruned {} frames", paths.len());
-                            }
-                            Ok(Err(e)) => tracing::trace!("Keyframe retention: {e}"),
-                            _ => {}
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_secs(86_400)).await;
-                    }
-                });
-                tracing::info!("✓ Keyframe retention sweep started");
-            }
+            // 9.7. Enforce "Keep history". Everything captured before the saved
+            // window — timeline rows, search (window context, OCR, transcripts)
+            // and vector entries, event logs, keyframes, video and audio, plus
+            // activity episodes and proactive suggestions — is
+            // deleted once on startup, then hourly. `/capture/control` also runs
+            // a sweep as soon as the window changes.
+            // Activity episodes and proactive suggestions are derived from the
+            // same capture, so the sweep prunes them with the same cutoff.
+            server::register_derived_history(server::DerivedHistoryStores {
+                episodes: episode_store.clone(),
+                proactive: Some(Arc::clone(&proactive_store)),
+            });
+            tokio::spawn(async move {
+                loop {
+                    server::run_history_sweep().await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3_600)).await;
+                }
+            });
+            tracing::info!("✓ History retention sweep started");
 
             // 9.8. Start the meeting auto-detection poller. Watches the OS for a
             // process using the microphone (the Granola/Notion mechanic) and
@@ -349,6 +391,8 @@ async fn main() -> anyhow::Result<()> {
             // 10. Start HTTP server (blocks)
             let state = server::AppState {
                 config: config.clone(),
+                computer_use: Arc::new(std::sync::RwLock::new(config.computer_use.clone())),
+                computer_use_lock: Arc::new(tokio::sync::Mutex::new(())),
                 orchestrator: Some(orchestrator),
                 procedure_store: Some(procedure_store),
                 proactive_store: Some(proactive_store),
@@ -361,7 +405,32 @@ async fn main() -> anyhow::Result<()> {
                 window_tracker: Some(window_tracker_handle),
                 ax_tree: Some(ax_tree_handle),
             };
-            server::run_server(state).await?;
+            // Close capture as soon as a stop is requested, before the server
+            // drains open connections (a long SSE stream must not delay it past
+            // Core's kill deadline): this writes and seals the open microphone
+            // segment and each display's open video segment.
+            let server = server::run_server(state);
+            tokio::pin!(server);
+            let mut capture_closed = false;
+            let served = tokio::select! {
+                served = &mut server => served,
+                () = server::shutdown_begun() => {
+                    if let Err(error) = capture_engine.stop().await {
+                        tracing::warn!("Capture engine stop failed: {error}");
+                    }
+                    capture_closed = true;
+                    server.await
+                }
+            };
+            if !capture_closed {
+                if let Err(error) = capture_engine.stop().await {
+                    tracing::warn!("Capture engine stop failed: {error}");
+                }
+            }
+            // Stop the shell hooks appending as soon as Shadow stops (the marker
+            // is only removed if it still names this process).
+            capture::passive::terminal::shutdown();
+            served?;
         }
 
         Commands::Stop => {
@@ -397,13 +466,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Search { query } => {
-            shadow_core::init_storage(
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".shadow")
-                    .to_string_lossy()
-                    .to_string(),
-            )?;
+            shadow_core::init_storage(paths::data_dir().to_string_lossy().to_string())?;
             match shadow_core::search_text(query, 100) {
                 Ok(results) => {
                     println!("Found {} results", results.len());

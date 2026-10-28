@@ -4,16 +4,27 @@ use rusqlite::Connection;
 use super::types::ProcedureTemplate;
 use crate::utils::wall_micros;
 
-/// SQLite-backed procedure store.
+/// Content store of `indices/procedures.db`.
+const STORE: &str = "shadow-procedures";
+/// Sealed columns: recorded steps can hold typed text.
+const SEALED: [&str; 4] = ["name", "description", "steps_json", "preconditions_json"];
+
+fn seal_field(id: &str, column: &str, value: &str) -> rusqlite::Result<String> {
+    crate::sealed_db::seal(STORE, "procedures", column, id, value)
+}
+
+/// SQLite-backed procedure store. Name, description, steps and preconditions
+/// are sealed; name matching runs here after opening (stores are small).
 pub struct ProcedureStore {
     conn: Connection,
 }
 
 impl ProcedureStore {
     pub fn new(db_path: &std::path::Path) -> Result<Self> {
-        std::fs::create_dir_all(db_path.parent().unwrap_or(std::path::Path::new(".")))?;
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch(
+        let columns: Vec<(&str, &str)> = SEALED.iter().map(|c| ("procedures", *c)).collect();
+        let conn = crate::sealed_db::open(
+            db_path,
+            STORE,
             "CREATE TABLE IF NOT EXISTS procedures (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -28,8 +39,23 @@ impl ProcedureStore {
             );
             CREATE INDEX IF NOT EXISTS idx_procedures_app ON procedures(app_name);
             CREATE INDEX IF NOT EXISTS idx_procedures_success ON procedures(success_count DESC);",
+            &columns,
         )?;
         Ok(Self { conn })
+    }
+
+    /// Every procedure, opened, by success count (unreadable rows skipped).
+    fn all(&self) -> Result<Vec<ProcedureTemplate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, app_name, description, steps_json, preconditions_json, \
+             success_count, failure_count, last_used, created_at \
+             FROM procedures ORDER BY success_count DESC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_procedure)?
+            .filter_map(|r| r.ok().flatten())
+            .collect();
+        Ok(rows)
     }
 
     pub fn save(&self, proc: &ProcedureTemplate) -> Result<()> {
@@ -40,11 +66,19 @@ impl ProcedureStore {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             rusqlite::params![
                 proc.id,
-                proc.name,
+                seal_field(&proc.id, "name", &proc.name)?,
                 proc.app_name,
-                proc.description,
-                serde_json::to_string(&proc.steps).unwrap_or_default(),
-                serde_json::to_string(&proc.preconditions).unwrap_or_default(),
+                seal_field(&proc.id, "description", &proc.description)?,
+                seal_field(
+                    &proc.id,
+                    "steps_json",
+                    &serde_json::to_string(&proc.steps).unwrap_or_default()
+                )?,
+                seal_field(
+                    &proc.id,
+                    "preconditions_json",
+                    &serde_json::to_string(&proc.preconditions).unwrap_or_default()
+                )?,
                 proc.success_count,
                 proc.failure_count,
                 proc.last_used as i64,
@@ -62,7 +96,7 @@ impl ProcedureStore {
         )?;
         let rows = stmt
             .query_map([], row_to_procedure)?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok().flatten())
             .collect();
         Ok(rows)
     }
@@ -73,26 +107,23 @@ impl ProcedureStore {
              success_count, failure_count, last_used, created_at \
              FROM procedures WHERE id = ?1",
         )?;
-        let result = stmt
-            .query_map([id], row_to_procedure)?
-            .next()
-            .and_then(|r| r.ok());
-        Ok(result)
+        // Get by id: a sealed field that does not open is an error, not "absent".
+        let result = stmt.query_map([id], row_to_procedure)?.next();
+        match result {
+            None => Ok(None),
+            Some(row) => match row? {
+                Some(procedure) => Ok(Some(procedure)),
+                None => anyhow::bail!("procedure {id} does not open"),
+            },
+        }
     }
 
     pub fn find_by_name(&self, name: &str) -> Result<Option<ProcedureTemplate>> {
-        let name_pat = format!("%{}%", name.to_lowercase());
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, app_name, description, steps_json, preconditions_json, \
-             success_count, failure_count, last_used, created_at \
-             FROM procedures WHERE lower(name) LIKE ?1 OR lower(description) LIKE ?1 \
-             ORDER BY success_count DESC LIMIT 1",
-        )?;
-        let result = stmt
-            .query_map([&name_pat], row_to_procedure)?
-            .next()
-            .and_then(|r| r.ok());
-        Ok(result)
+        let needle = name.to_lowercase();
+        Ok(self.all()?.into_iter().find(|p| {
+            p.name.to_lowercase().contains(&needle)
+                || p.description.to_lowercase().contains(&needle)
+        }))
     }
 
     pub fn record_success(&self, id: &str) -> Result<()> {
@@ -132,15 +163,9 @@ impl ProcedureStore {
         }
 
         // Load all and filter in Rust; procedure stores are small (<1000 rows)
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, app_name, description, steps_json, preconditions_json, \
-             success_count, failure_count, last_used, created_at \
-             FROM procedures ORDER BY success_count DESC",
-        )?;
-
-        let mut results: Vec<ProcedureTemplate> = stmt
-            .query_map([], row_to_procedure)?
-            .filter_map(|r| r.ok())
+        let results: Vec<ProcedureTemplate> = self
+            .all()?
+            .into_iter()
             .filter(|p| {
                 let name_lower = p.name.to_lowercase();
                 let desc_lower = p.description.to_lowercase();
@@ -155,19 +180,38 @@ impl ProcedureStore {
     }
 }
 
-fn row_to_procedure(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcedureTemplate> {
-    Ok(ProcedureTemplate {
-        id: row.get(0)?,
-        name: row.get(1)?,
+/// A procedure from a row; `None` (counted) when a sealed field does not open.
+fn row_to_procedure(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ProcedureTemplate>> {
+    let id: String = row.get(0)?;
+    let open = |column: &str, index: usize| -> rusqlite::Result<Option<String>> {
+        Ok(crate::sealed_db::open_value(
+            STORE,
+            "procedures",
+            column,
+            &id,
+            row.get(index)?,
+        ))
+    };
+    let (Some(name), Some(description), Some(steps), Some(preconditions)) = (
+        open("name", 1)?,
+        open("description", 3)?,
+        open("steps_json", 4)?,
+        open("preconditions_json", 5)?,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(ProcedureTemplate {
+        id: id.clone(),
+        name,
         app_name: row.get(2)?,
-        description: row.get(3)?,
-        steps: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-        preconditions: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+        description,
+        steps: serde_json::from_str(&steps).unwrap_or_default(),
+        preconditions: serde_json::from_str(&preconditions).unwrap_or_default(),
         success_count: row.get::<_, i64>(6)? as u32,
         failure_count: row.get::<_, i64>(7)? as u32,
         last_used: row.get::<_, i64>(8)? as u64,
         created_at: row.get::<_, i64>(9)? as u64,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -175,7 +219,27 @@ mod tests {
     use super::*;
     use crate::mimicry::types::{ProcedureStep, StepFailureAction};
 
+    #[test]
+    fn procedure_steps_are_sealed_on_disk() {
+        let (store, dir) = temp_store();
+        let mut p = make("ps", "Pay rent-tapir", "Bank", "monthly");
+        p.steps[0].tool_args = serde_json::json!({"text": "acct-9988-numbat"});
+        store.save(&p).unwrap();
+        let db = dir.join("procedures.db");
+        assert!(!crate::sealed_db::test_support::db_contains(
+            &db,
+            "rent-tapir"
+        ));
+        assert!(!crate::sealed_db::test_support::db_contains(
+            &db,
+            "acct-9988-numbat"
+        ));
+        assert_eq!(store.find_by_name("TAPIR").unwrap().unwrap().id, "ps");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn temp_store() -> (ProcedureStore, std::path::PathBuf) {
+        crate::sealed_db::test_support::key();
         let dir = std::env::temp_dir().join(format!("shadow-proc-{}", uuid::Uuid::new_v4()));
         let db = dir.join("procedures.db");
         (ProcedureStore::new(&db).expect("open store"), dir)

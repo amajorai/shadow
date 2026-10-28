@@ -17,16 +17,20 @@ pub struct MemoryEntry {
     pub created_at: u64,
 }
 
-/// SQLite-backed semantic memory store.
+/// Content store of `indices/memory.db` (sealed `memory_entries.content`).
+const STORE: &str = "shadow-memory";
+
+/// SQLite-backed semantic memory store. `content` is sealed, so text matching
+/// and duplicate checks run here after opening (the store holds few rows).
 pub struct SemanticMemoryStore {
     conn: Connection,
 }
 
 impl SemanticMemoryStore {
     pub fn new(db_path: &std::path::Path) -> Result<Self> {
-        std::fs::create_dir_all(db_path.parent().unwrap_or(std::path::Path::new(".")))?;
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch(
+        let conn = crate::sealed_db::open(
+            db_path,
+            STORE,
             "CREATE TABLE IF NOT EXISTS memory_entries (
                 id TEXT PRIMARY KEY,
                 category TEXT NOT NULL,
@@ -39,26 +43,39 @@ impl SemanticMemoryStore {
             );
             CREATE INDEX IF NOT EXISTS idx_memory_category ON memory_entries(category);
             CREATE INDEX IF NOT EXISTS idx_memory_created ON memory_entries(created_at DESC);",
+            &[("memory_entries", "content")],
         )?;
         Ok(Self { conn })
+    }
+
+    /// Every entry (optionally of one category), opened, best first. Rows whose
+    /// content does not open are skipped (and counted).
+    fn all_entries(&self, category: Option<&str>) -> Result<Vec<MemoryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, category, content, confidence, source_episode_id, \
+             access_count, last_accessed, created_at \
+             FROM memory_entries WHERE (?1 IS NULL OR category = ?1) \
+             ORDER BY confidence DESC, access_count DESC",
+        )?;
+        let entries = stmt
+            .query_map(rusqlite::params![category], row_to_entry)?
+            .filter_map(|r| r.ok().flatten())
+            .collect();
+        Ok(entries)
     }
 
     /// Query memories by optional category and text substring.
     pub fn query(&self, category: Option<&str>, text: &str) -> Result<Vec<MemoryEntry>> {
         let now = wall_micros();
-        let text_pat = format!("%{}%", text.to_lowercase());
+        let needle = text.to_lowercase();
 
-        // Use a single query that fetches all matching text entries, then
-        // filter by category in Rust to avoid stmt-in-match-arm lifetime issues.
-        let mut stmt = self.conn.prepare(
-            "SELECT id, category, content, confidence, source_episode_id, \
-             access_count, last_accessed, created_at \
-             FROM memory_entries WHERE lower(content) LIKE ?1 \
-             ORDER BY confidence DESC, access_count DESC LIMIT 50",
-        )?;
-        let mut entries: Vec<MemoryEntry> = stmt
-            .query_map(rusqlite::params![text_pat], row_to_entry)?
-            .filter_map(|r| r.ok())
+        // Content is sealed: match the substring after opening, keeping the old
+        // order and caps (50 text matches, then the category filter, then 20).
+        let mut entries: Vec<MemoryEntry> = self
+            .all_entries(None)?
+            .into_iter()
+            .filter(|entry| entry.content.to_lowercase().contains(&needle))
+            .take(50)
             .collect();
 
         if let Some(cat) = category {
@@ -81,13 +98,10 @@ impl SemanticMemoryStore {
     pub fn upsert(&self, entry: &MemoryEntry) -> Result<()> {
         // Check for duplicate by category + content similarity
         let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM memory_entries WHERE category = ?1 AND content = ?2 LIMIT 1",
-                rusqlite::params![entry.category, entry.content],
-                |row| row.get(0),
-            )
-            .ok();
+            .all_entries(Some(&entry.category))?
+            .into_iter()
+            .find(|candidate| candidate.content == entry.content)
+            .map(|candidate| candidate.id);
 
         if let Some(existing_id) = existing {
             // Update existing
@@ -102,7 +116,7 @@ impl SemanticMemoryStore {
                 rusqlite::params![
                     entry.id,
                     entry.category,
-                    entry.content,
+                    crate::sealed_db::seal(STORE, "memory_entries", "content", &entry.id, &entry.content)?,
                     entry.confidence as f64,
                     entry.source_episode_id,
                     entry.access_count,
@@ -121,31 +135,29 @@ impl SemanticMemoryStore {
     }
 
     pub fn list_by_category(&self, category: &str) -> Result<Vec<MemoryEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, category, content, confidence, source_episode_id, \
-             access_count, last_accessed, created_at \
-             FROM memory_entries WHERE category = ?1 \
-             ORDER BY confidence DESC LIMIT 50",
-        )?;
-        let entries = stmt
-            .query_map([category], row_to_entry)?
-            .filter_map(|r| r.ok())
-            .collect();
+        let mut entries = self.all_entries(Some(category))?;
+        entries.truncate(50);
         Ok(entries)
     }
 }
 
-fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
-    Ok(MemoryEntry {
-        id: row.get(0)?,
+fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<MemoryEntry>> {
+    let id: String = row.get(0)?;
+    let Some(content) =
+        crate::sealed_db::open_value(STORE, "memory_entries", "content", &id, row.get(2)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(MemoryEntry {
+        id,
         category: row.get(1)?,
-        content: row.get(2)?,
+        content,
         confidence: row.get::<_, f64>(3)? as f32,
         source_episode_id: row.get(4)?,
         access_count: row.get::<_, i64>(5)? as u32,
         last_accessed: row.get::<_, i64>(6)? as u64,
         created_at: row.get::<_, i64>(7)? as u64,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -153,7 +165,29 @@ mod tests {
     use super::*;
 
     fn temp_db() -> std::path::PathBuf {
+        crate::sealed_db::test_support::key();
         std::env::temp_dir().join(format!("shadow-semantic-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn memory_content_is_sealed_on_disk_and_still_matches() {
+        let path = temp_db();
+        let store = SemanticMemoryStore::new(&path).unwrap();
+        store
+            .upsert(&entry("s1", "fact", "Allergic to hazelnut-xyzzy", 0.9))
+            .unwrap();
+        // Duplicate content in the same category updates, never inserts.
+        store
+            .upsert(&entry("s2", "fact", "Allergic to hazelnut-xyzzy", 0.95))
+            .unwrap();
+        assert!(!crate::sealed_db::test_support::db_contains(
+            &path,
+            "hazelnut-xyzzy"
+        ));
+        let hits = store.query(None, "HAZELNUT").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "s1");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn entry(id: &str, category: &str, content: &str, confidence: f32) -> MemoryEntry {

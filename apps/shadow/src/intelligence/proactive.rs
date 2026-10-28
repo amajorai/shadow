@@ -301,6 +301,41 @@ fn extract_json_array(s: &str) -> Option<String> {
     }
 }
 
+/// Content store of `indices/proactive.db` (sealed `title`, `body`, `metadata`).
+const STORE: &str = "shadow-proactive";
+
+fn seal_field(id: &str, column: &str, value: &str) -> rusqlite::Result<String> {
+    crate::sealed_db::seal(STORE, "proactive_suggestions", column, id, value)
+}
+
+fn open_field(id: &str, column: &str, stored: String) -> Option<String> {
+    crate::sealed_db::open_value(STORE, "proactive_suggestions", column, id, stored)
+}
+
+/// A suggestion from a row of the shared SELECT; `None` (counted) when a
+/// sealed field does not open.
+fn suggestion_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ProactiveSuggestion>> {
+    let id: String = row.get(0)?;
+    let (Some(title), Some(body), Some(metadata)) = (
+        open_field(&id, "title", row.get(2)?),
+        open_field(&id, "body", row.get(3)?),
+        open_field(&id, "metadata", row.get(7)?),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(ProactiveSuggestion {
+        suggestion_type: parse_suggestion_type(row.get::<_, String>(1)?.as_str()),
+        title,
+        body,
+        confidence: row.get::<_, f64>(4)? as f32,
+        disposition: parse_disposition(row.get::<_, String>(5)?.as_str()),
+        created_at: row.get::<_, i64>(6)? as u64,
+        metadata: serde_json::from_str(&metadata)
+            .unwrap_or(serde_json::Value::Object(Default::default())),
+        id,
+    }))
+}
+
 /// Stores proactive suggestions in SQLite.
 pub struct ProactiveStore {
     conn: rusqlite::Connection,
@@ -308,8 +343,9 @@ pub struct ProactiveStore {
 
 impl ProactiveStore {
     pub fn new(db_path: &std::path::Path) -> Result<Self> {
-        let conn = rusqlite::Connection::open(db_path)?;
-        conn.execute_batch(
+        let conn = crate::sealed_db::open(
+            db_path,
+            STORE,
             "CREATE TABLE IF NOT EXISTS proactive_suggestions (
                 id TEXT PRIMARY KEY,
                 suggestion_type TEXT NOT NULL,
@@ -320,6 +356,11 @@ impl ProactiveStore {
                 created_at INTEGER NOT NULL,
                 metadata TEXT NOT NULL DEFAULT '{}'
             );",
+            &[
+                ("proactive_suggestions", "title"),
+                ("proactive_suggestions", "body"),
+                ("proactive_suggestions", "metadata"),
+            ],
         )?;
         Ok(Self { conn })
     }
@@ -332,15 +373,30 @@ impl ProactiveStore {
             rusqlite::params![
                 suggestion.id,
                 format!("{:?}", suggestion.suggestion_type),
-                suggestion.title,
-                suggestion.body,
+                seal_field(&suggestion.id, "title", &suggestion.title)?,
+                seal_field(&suggestion.id, "body", &suggestion.body)?,
                 suggestion.confidence as f64,
                 format!("{:?}", suggestion.disposition),
                 suggestion.created_at as i64,
-                serde_json::to_string(&suggestion.metadata).unwrap_or_default()
+                seal_field(
+                    &suggestion.id,
+                    "metadata",
+                    &serde_json::to_string(&suggestion.metadata).unwrap_or_default()
+                )?
             ],
         )?;
         Ok(())
+    }
+
+    /// Delete suggestions created before `cutoff_us` (Unix microseconds). They
+    /// are built from captured activity, so the "Keep history" sweep removes
+    /// them with the rest of the timeline.
+    pub fn delete_before(&self, cutoff_us: u64) -> Result<usize> {
+        let cutoff = i64::try_from(cutoff_us).unwrap_or(i64::MAX);
+        Ok(self.conn.execute(
+            "DELETE FROM proactive_suggestions WHERE created_at < ?1",
+            [cutoff],
+        )?)
     }
 
     pub fn list_recent(&self, limit: usize) -> Result<Vec<ProactiveSuggestion>> {
@@ -349,21 +405,9 @@ impl ProactiveStore {
              FROM proactive_suggestions ORDER BY created_at DESC LIMIT ?1",
         )?;
 
-        let rows = stmt.query_map([limit as i64], |row| {
-            Ok(ProactiveSuggestion {
-                id: row.get(0)?,
-                suggestion_type: parse_suggestion_type(row.get::<_, String>(1)?.as_str()),
-                title: row.get(2)?,
-                body: row.get(3)?,
-                confidence: row.get::<_, f64>(4)? as f32,
-                disposition: parse_disposition(row.get::<_, String>(5)?.as_str()),
-                created_at: row.get::<_, i64>(6)? as u64,
-                metadata: serde_json::from_str(&row.get::<_, String>(7)?)
-                    .unwrap_or(serde_json::Value::Object(Default::default())),
-            })
-        })?;
+        let rows = stmt.query_map([limit as i64], |row| suggestion_from_row(row))?;
 
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|r| r.ok().flatten()).collect())
     }
 
     pub fn get(&self, id: &str) -> Result<Option<ProactiveSuggestion>> {
@@ -371,32 +415,30 @@ impl ProactiveStore {
             "SELECT id, suggestion_type, title, body, confidence, disposition, created_at, metadata \
              FROM proactive_suggestions WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map([id], |row| {
-            Ok(ProactiveSuggestion {
-                id: row.get(0)?,
-                suggestion_type: parse_suggestion_type(row.get::<_, String>(1)?.as_str()),
-                title: row.get(2)?,
-                body: row.get(3)?,
-                confidence: row.get::<_, f64>(4)? as f32,
-                disposition: parse_disposition(row.get::<_, String>(5)?.as_str()),
-                created_at: row.get::<_, i64>(6)? as u64,
-                metadata: serde_json::from_str(&row.get::<_, String>(7)?)
-                    .unwrap_or(serde_json::Value::Object(Default::default())),
-            })
-        })?;
-        Ok(rows.next().and_then(|r| r.ok()))
+        let mut rows = stmt.query_map([id], |row| suggestion_from_row(row))?;
+        // Get by id: a sealed field that does not open is an error, not "absent".
+        match rows.next() {
+            None => Ok(None),
+            Some(row) => match row? {
+                Some(suggestion) => Ok(Some(suggestion)),
+                None => anyhow::bail!("suggestion {id} does not open"),
+            },
+        }
     }
 
     /// Return titles of suggestions created within the last `within_secs` seconds.
     pub fn recent_titles(&self, within_secs: u64) -> Vec<String> {
         let cutoff = (wall_micros().saturating_sub(within_secs * 1_000_000)) as i64;
         self.conn
-            .prepare("SELECT title FROM proactive_suggestions WHERE created_at >= ?1")
+            .prepare("SELECT id, title FROM proactive_suggestions WHERE created_at >= ?1")
             .ok()
             .and_then(|mut stmt| {
-                stmt.query_map([cutoff], |row| row.get::<_, String>(0))
-                    .ok()
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                stmt.query_map([cutoff], |row| {
+                    let id: String = row.get(0)?;
+                    Ok(open_field(&id, "title", row.get(1)?))
+                })
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok().flatten()).collect())
             })
             .unwrap_or_default()
     }
@@ -554,6 +596,28 @@ mod tests {
             created_at: 1,
             metadata: serde_json::Value::Object(Default::default()),
         }
+    }
+
+    #[test]
+    fn delete_before_removes_suggestions_created_before_the_cutoff() {
+        let path = std::env::temp_dir().join(format!("shadow-proactive-{}", uuid::Uuid::new_v4()));
+        let store = ProactiveStore::new(&path).unwrap();
+        let mut old = suggestion(SuggestionType::Followup, 0.5);
+        old.created_at = 100;
+        let mut new = suggestion(SuggestionType::Reminder, 0.5);
+        new.created_at = 2_000;
+        store.store(&old).unwrap();
+        store.store(&new).unwrap();
+
+        assert_eq!(store.delete_before(1_000).unwrap(), 1);
+        let left: Vec<String> = store
+            .list_recent(10)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(left, [new.id]);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -727,7 +791,35 @@ mod tests {
     }
 
     #[test]
+    fn proactive_text_is_sealed_on_disk() {
+        crate::sealed_db::test_support::key();
+        let path = std::env::temp_dir().join(format!("shadow-proactive-{}", uuid::Uuid::new_v4()));
+        let store = ProactiveStore::new(&path).unwrap();
+        let mut s = suggestion(SuggestionType::Reminder, 0.7);
+        s.title = "Renew passport-plover".into();
+        s.body = "Appointment at clinic-wombat".into();
+        store.store(&s).unwrap();
+        assert!(!crate::sealed_db::test_support::db_contains(
+            &path,
+            "passport-plover"
+        ));
+        assert!(!crate::sealed_db::test_support::db_contains(
+            &path,
+            "clinic-wombat"
+        ));
+        assert_eq!(
+            store.get(&s.id).unwrap().unwrap().title,
+            "Renew passport-plover"
+        );
+        assert!(store
+            .recent_titles(u64::MAX / 2_000_000)
+            .contains(&"Renew passport-plover".to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn proactive_store_round_trips_suggestion() {
+        crate::sealed_db::test_support::key();
         let path = std::env::temp_dir().join(format!("shadow-proactive-{}", uuid::Uuid::new_v4()));
         let store = ProactiveStore::new(&path).unwrap();
         let mut s = suggestion(SuggestionType::Reminder, 0.7);
@@ -746,6 +838,7 @@ mod tests {
 
     #[test]
     fn proactive_store_recent_titles_respects_window() {
+        crate::sealed_db::test_support::key();
         let path = std::env::temp_dir().join(format!("shadow-proactive-{}", uuid::Uuid::new_v4()));
         let store = ProactiveStore::new(&path).unwrap();
         let mut fresh = suggestion(SuggestionType::Reminder, 0.7);
@@ -769,6 +862,7 @@ mod tests {
 
     #[test]
     fn proactive_store_get_missing_returns_none() {
+        crate::sealed_db::test_support::key();
         let path = std::env::temp_dir().join(format!("shadow-proactive-{}", uuid::Uuid::new_v4()));
         let store = ProactiveStore::new(&path).unwrap();
         assert!(store.get("nope").unwrap().is_none());

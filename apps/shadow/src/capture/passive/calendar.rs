@@ -1,6 +1,6 @@
 //! Calendar capture — surfaces upcoming calendar events (track 11).
 //!
-//! Portable + nothing-hardcoded: point `SHADOW_CALENDAR_ICS` at an iCalendar
+//! Portable + nothing-hardcoded: point `calendarIcs` in `passive-capture.json` at an iCalendar
 //! (`.ics`) file — the format every major calendar (Google, Apple, Outlook,
 //! Fastmail) can export or sync to disk. This source polls it and emits one event
 //! per upcoming meeting (today/tomorrow), deduped by UID+start so a meeting is not
@@ -71,19 +71,13 @@ fn date_prefix(start: &str) -> Option<String> {
     }
 }
 
-fn ics_path() -> Option<PathBuf> {
-    std::env::var("SHADOW_CALENDAR_ICS")
-        .ok()
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-}
-
 /// Start calendar monitoring on a dedicated thread (no-op unless an ICS path is set).
-pub fn start() {
-    let Some(path) = ics_path() else {
+pub fn start(ics_path: Option<PathBuf>) {
+    let Some(path) = ics_path else {
         tracing::info!(
-            "Calendar capture idle on track {} — set SHADOW_CALENDAR_ICS to an .ics file to enable",
-            super::TRACK_CALENDAR
+            "Calendar capture idle on track {}: set calendarIcs in {} to an .ics file to enable",
+            super::TRACK_CALENDAR,
+            super::settings::FILE_NAME
         );
         return;
     };

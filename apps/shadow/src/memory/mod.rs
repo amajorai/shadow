@@ -87,6 +87,7 @@ mod tests {
     }
 
     fn temp_db() -> std::path::PathBuf {
+        crate::sealed_db::test_support::key();
         std::env::temp_dir().join(format!("shadow-memfacade-{}", uuid::Uuid::new_v4()))
     }
 

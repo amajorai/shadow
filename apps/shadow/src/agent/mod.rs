@@ -1,3 +1,4 @@
+pub mod computer_use;
 pub mod context_budget;
 pub mod decomposer;
 pub mod intent_classifier;

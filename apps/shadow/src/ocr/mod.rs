@@ -73,8 +73,11 @@ impl MacOsOcr {
 impl OcrEngine for MacOsOcr {
     async fn recognize(&self, image: &DynamicImage) -> Result<String> {
         // Write frame to a temp PNG, invoke the `tesseract` CLI, read result.
-        // Requires: brew install tesseract
-        let tmp_dir = std::env::temp_dir();
+        // Requires: brew install tesseract. The frame is screen content: it goes
+        // to Shadow's owner-only scratch dir (0700, file 0600), never the shared
+        // system temp dir, and is deleted right after tesseract reads it.
+        let tmp_dir = crate::paths::tmp_dir();
+        shadow_core::seal::create_private_dir(&tmp_dir)?;
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -85,7 +88,16 @@ impl OcrEngine for MacOsOcr {
 
         let mut buf = Vec::new();
         image.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
-        std::fs::write(&in_path, &buf)?;
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&in_path)?;
+            file.write_all(&buf)?;
+        }
 
         let output = tokio::process::Command::new("tesseract")
             .arg(&in_path)

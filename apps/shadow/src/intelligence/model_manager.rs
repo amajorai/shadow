@@ -37,9 +37,10 @@ pub struct ModelManager {
 }
 
 impl ModelManager {
-    pub fn new(data_dir: &Path) -> Self {
+    /// `models_dir` is Shadow's model folder (`crate::paths::models_dir`).
+    pub fn new(models_dir: &Path) -> Self {
         Self {
-            models_dir: data_dir.join("models"),
+            models_dir: models_dir.to_path_buf(),
         }
     }
 

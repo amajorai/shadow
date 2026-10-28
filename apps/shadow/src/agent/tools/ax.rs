@@ -597,41 +597,8 @@ impl AgentTool for CaptureLiveScreenshotTool {
     }
 }
 
-/// Replay a learned procedure by name.
-pub struct ReplayProcedureTool;
-
-#[async_trait]
-impl AgentTool for ReplayProcedureTool {
-    fn definition(&self) -> Tool {
-        Tool {
-            name: "replay_procedure".to_string(),
-            description: "Look up and execute a stored procedure by name (learned automation)"
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Procedure name or description"}
-                },
-                "required": ["name"]
-            }),
-        }
-    }
-
-    async fn execute(&self, params: serde_json::Value) -> Result<ToolResult> {
-        let name = params["name"].as_str().unwrap_or("");
-
-        Ok(ToolResult {
-            tool_name: "replay_procedure".to_string(),
-            result: json!({
-                "message": format!("Procedure '{}' queued for execution", name)
-            }),
-            error: None,
-        })
-    }
-}
-
 /// Hint string listing available AX/automation tools for the mimicry planner prompt.
 pub const AVAILABLE_TOOLS_HINT: &str = "\
 ax_click, ax_type, ax_hotkey, ax_scroll, ax_wait, ax_focus_app, \
 ax_read_text, ax_inspect, ax_element_at, ax_list_apps, ax_tree_query, \
-capture_live_screenshot, replay_procedure";
+capture_live_screenshot";

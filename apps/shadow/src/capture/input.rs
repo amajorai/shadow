@@ -2,10 +2,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 /// Input event types.
+///
+/// Key events deliberately carry no key code: the hooks report only that a
+/// key went down or up (see `input_event_record`).
 #[derive(Debug, Clone)]
 pub enum InputEvent {
-    KeyDown { vk_code: u32 },
-    KeyUp { vk_code: u32 },
+    KeyDown,
+    KeyUp,
     MouseDown { x: i32, y: i32, button: u8 },
     MouseUp { x: i32, y: i32, button: u8 },
     MouseMove { x: i32, y: i32 },
@@ -16,6 +19,108 @@ pub enum InputEvent {
 pub trait InputMonitor: Send + Sync {
     async fn start(&mut self) -> Result<()>;
     async fn stop(&mut self) -> Result<()>;
+}
+
+// ─── Shared: move throttle + shadow-core ingestion ───────────────────────────
+
+/// Throttle pointer moves: emit only once the pointer is ≥50px from the last
+/// emitted position. Each platform's hook has exactly one call site, so a single
+/// `static` holds that hook's last position.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn throttled_mouse_move(x: i32, y: i32) -> Option<InputEvent> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_POS: AtomicU64 = AtomicU64::new(0);
+    let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
+    let last = LAST_POS.load(Ordering::Relaxed);
+    let lx = (last >> 32) as i32;
+    let ly = (last & 0xFFFF_FFFF) as i32;
+    if (x - lx).pow(2) + (y - ly).pow(2) < 2500 {
+        None
+    } else {
+        LAST_POS.store(packed, Ordering::Relaxed);
+        Some(InputEvent::MouseMove { x, y })
+    }
+}
+
+/// Ingest a monitor's events into shadow-core until the channel closes or the
+/// monitor is stopped.
+fn spawn_ingest_task(
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                event = event_rx.recv() => match event {
+                    Some(ev) => ingest_input_event(ev),
+                    None => break,
+                },
+                _ = &mut stop_rx => break,
+            }
+        }
+    });
+}
+
+/// Write one event to shadow-core's input track (track 2) unless capture is paused.
+fn ingest_input_event(event: InputEvent) {
+    if crate::server::is_capture_paused() {
+        return;
+    }
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    let map = input_event_record(&event, now_us);
+
+    if let Ok(data) = rmp_serde::to_vec(&map) {
+        let _ = shadow_core::write_event(data);
+    }
+}
+
+/// Build the persisted track-2 record for an input event. Every platform
+/// monitor writes exactly this shape to the event log.
+///
+/// Key events record only that a key went down or up, never which key. The
+/// global hooks see every keystroke system-wide (password fields and apps
+/// outside the capture allowlist included) and the event log is plaintext, so
+/// a stored key code would let anyone who can read the data dir replay typed
+/// text, credentials included. Nothing downstream reads a key code: the index,
+/// timeline, and workflow/behavioural analysis use only `ts`/`track`/`type`.
+fn input_event_record(
+    event: &InputEvent,
+    now_us: u64,
+) -> std::collections::HashMap<&'static str, rmpv::Value> {
+    let mut map = std::collections::HashMap::new();
+    map.insert("ts", rmpv::Value::from(now_us));
+    map.insert("v", rmpv::Value::from(2u8));
+    map.insert("track", rmpv::Value::from(2u8));
+
+    match *event {
+        InputEvent::KeyDown => {
+            map.insert("type", rmpv::Value::from("key_down"));
+        }
+        InputEvent::KeyUp => {
+            map.insert("type", rmpv::Value::from("key_up"));
+        }
+        InputEvent::MouseDown { x, y, button } => {
+            map.insert("type", rmpv::Value::from("mouse_down"));
+            map.insert("x", rmpv::Value::from(x));
+            map.insert("y", rmpv::Value::from(y));
+            map.insert("button", rmpv::Value::from(button));
+        }
+        InputEvent::MouseUp { x, y, button } => {
+            map.insert("type", rmpv::Value::from("mouse_up"));
+            map.insert("x", rmpv::Value::from(x));
+            map.insert("y", rmpv::Value::from(y));
+            map.insert("button", rmpv::Value::from(button));
+        }
+        InputEvent::MouseMove { x, y } => {
+            map.insert("type", rmpv::Value::from("mouse_move"));
+            map.insert("x", rmpv::Value::from(x));
+            map.insert("y", rmpv::Value::from(y));
+        }
+    }
+    map
 }
 
 // ─── Windows: SetWindowsHookEx (WH_KEYBOARD_LL + WH_MOUSE_LL) ────────────────
@@ -32,11 +137,10 @@ mod windows_impl {
 
     unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code >= 0 {
-            let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let event = if wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN {
-                InputEvent::KeyDown { vk_code: kb.vkCode }
+                InputEvent::KeyDown
             } else {
-                InputEvent::KeyUp { vk_code: kb.vkCode }
+                InputEvent::KeyUp
             };
             if let Some(tx) = INPUT_TX.get() {
                 if let Ok(tx) = tx.lock() {
@@ -60,23 +164,7 @@ mod windows_impl {
                 WM_LBUTTONUP => Some(InputEvent::MouseUp { x, y, button: 0 }),
                 WM_RBUTTONUP => Some(InputEvent::MouseUp { x, y, button: 1 }),
                 WM_MBUTTONUP => Some(InputEvent::MouseUp { x, y, button: 2 }),
-                WM_MOUSEMOVE => {
-                    // Throttle mouse moves: only emit every ~50 pixels
-                    static LAST_POS: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
-                    let last = LAST_POS.load(std::sync::atomic::Ordering::Relaxed);
-                    let lx = (last >> 32) as i32;
-                    let ly = (last & 0xFFFF_FFFF) as i32;
-                    let dist = ((x - lx).pow(2) + (y - ly).pow(2)) as f64;
-                    if dist < 2500.0 {
-                        // < 50px
-                        None
-                    } else {
-                        LAST_POS.store(packed, std::sync::atomic::Ordering::Relaxed);
-                        Some(InputEvent::MouseMove { x, y })
-                    }
-                }
+                WM_MOUSEMOVE => super::throttled_mouse_move(x, y),
                 _ => None,
             };
 
@@ -104,7 +192,7 @@ mod windows_impl {
     #[async_trait]
     impl super::InputMonitor for WindowsInputMonitor {
         async fn start(&mut self) -> Result<()> {
-            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
             let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
             // Store the sender globally for the hook callbacks
@@ -135,24 +223,7 @@ mod windows_impl {
                 }
             });
 
-            // Spawn event processing task
-            tokio::spawn(async move {
-                let mut stop = stop_rx;
-                loop {
-                    tokio::select! {
-                        event = event_rx.recv() => {
-                            match event {
-                                Some(ev) => {
-                                    // Ingest event into shadow-core
-                                    ingest_input_event(ev);
-                                }
-                                None => break,
-                            }
-                        }
-                        _ = &mut stop => break,
-                    }
-                }
-            });
+            super::spawn_ingest_task(event_rx, stop_rx);
 
             self.stop_tx = Some(stop_tx);
             tracing::info!("Windows input monitor started (WH_KEYBOARD_LL + WH_MOUSE_LL)");
@@ -164,59 +235,6 @@ mod windows_impl {
                 let _ = tx.send(());
             }
             Ok(())
-        }
-    }
-
-    fn ingest_input_event(event: InputEvent) {
-        if crate::server::is_capture_paused() {
-            return;
-        }
-        use std::collections::HashMap;
-
-        let mut map: HashMap<&str, rmpv::Value> = HashMap::new();
-        let now_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-
-        map.insert("ts", rmpv::Value::from(now_us));
-        map.insert("v", rmpv::Value::from(2u8));
-
-        match event {
-            InputEvent::KeyDown { vk_code } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("key_down"));
-                map.insert("key_code", rmpv::Value::from(vk_code));
-            }
-            InputEvent::KeyUp { vk_code } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("key_up"));
-                map.insert("key_code", rmpv::Value::from(vk_code));
-            }
-            InputEvent::MouseDown { x, y, button } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("mouse_down"));
-                map.insert("x", rmpv::Value::from(x));
-                map.insert("y", rmpv::Value::from(y));
-                map.insert("button", rmpv::Value::from(button));
-            }
-            InputEvent::MouseUp { x, y, button } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("mouse_up"));
-                map.insert("x", rmpv::Value::from(x));
-                map.insert("y", rmpv::Value::from(y));
-                map.insert("button", rmpv::Value::from(button));
-            }
-            InputEvent::MouseMove { x, y } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("mouse_move"));
-                map.insert("x", rmpv::Value::from(x));
-                map.insert("y", rmpv::Value::from(y));
-            }
-        }
-
-        if let Ok(data) = rmp_serde::to_vec(&map) {
-            let _ = shadow_core::write_event(data);
         }
     }
 }
@@ -247,7 +265,6 @@ mod macos_impl {
     const KCG_EVENT_KEY_UP: u32 = 11;
 
     // CGEventField constants
-    const KCG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
     const KCG_MOUSE_EVENT_BUTTON_NUMBER: u32 = 71;
 
     // CGEventTap parameters
@@ -301,14 +318,8 @@ mod macos_impl {
             let y = pt.y as i32;
 
             let ev = match event_type {
-                t if t == KCG_EVENT_KEY_DOWN => {
-                    let kc = CGEventGetIntegerValueField(event, KCG_KEYBOARD_EVENT_KEYCODE) as u32;
-                    Some(super::InputEvent::KeyDown { vk_code: kc })
-                }
-                t if t == KCG_EVENT_KEY_UP => {
-                    let kc = CGEventGetIntegerValueField(event, KCG_KEYBOARD_EVENT_KEYCODE) as u32;
-                    Some(super::InputEvent::KeyUp { vk_code: kc })
-                }
+                t if t == KCG_EVENT_KEY_DOWN => Some(super::InputEvent::KeyDown),
+                t if t == KCG_EVENT_KEY_UP => Some(super::InputEvent::KeyUp),
                 t if t == KCG_EVENT_LEFT_MOUSE_DOWN => {
                     Some(super::InputEvent::MouseDown { x, y, button: 0 })
                 }
@@ -331,20 +342,7 @@ mod macos_impl {
                         CGEventGetIntegerValueField(event, KCG_MOUSE_EVENT_BUTTON_NUMBER) as u8;
                     Some(super::InputEvent::MouseUp { x, y, button: btn })
                 }
-                t if t == KCG_EVENT_MOUSE_MOVED => {
-                    static LAST: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
-                    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
-                    let lx = (last >> 32) as i32;
-                    let ly = (last & 0xFFFF_FFFF) as i32;
-                    if (x - lx).pow(2) + (y - ly).pow(2) < 2500 {
-                        None
-                    } else {
-                        LAST.store(packed, std::sync::atomic::Ordering::Relaxed);
-                        Some(super::InputEvent::MouseMove { x, y })
-                    }
-                }
+                t if t == KCG_EVENT_MOUSE_MOVED => super::throttled_mouse_move(x, y),
                 _ => None,
             };
 
@@ -372,8 +370,7 @@ mod macos_impl {
     #[async_trait]
     impl super::InputMonitor for MacOSInputMonitor {
         async fn start(&mut self) -> Result<()> {
-            let (event_tx, mut event_rx) =
-                tokio::sync::mpsc::unbounded_channel::<super::InputEvent>();
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<super::InputEvent>();
             let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
             INPUT_TX.get_or_init(|| Mutex::new(event_tx));
@@ -410,19 +407,7 @@ mod macos_impl {
                 CFRunLoopRun();
             });
 
-            // Process events
-            tokio::spawn(async move {
-                let mut stop = stop_rx;
-                loop {
-                    tokio::select! {
-                        ev = event_rx.recv() => match ev {
-                            Some(e) => ingest_input_event(e),
-                            None => break,
-                        },
-                        _ = &mut stop => break,
-                    }
-                }
-            });
+            super::spawn_ingest_task(event_rx, stop_rx);
 
             self.stop_tx = Some(stop_tx);
             tracing::info!("macOS input monitor started");
@@ -434,55 +419,6 @@ mod macos_impl {
                 let _ = tx.send(());
             }
             Ok(())
-        }
-    }
-
-    fn ingest_input_event(event: super::InputEvent) {
-        if crate::server::is_capture_paused() {
-            return;
-        }
-        use std::collections::HashMap;
-        let mut map: HashMap<&str, rmpv::Value> = HashMap::new();
-        let now_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-        map.insert("ts", rmpv::Value::from(now_us));
-        map.insert("v", rmpv::Value::from(2u8));
-        match event {
-            super::InputEvent::KeyDown { vk_code } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("key_down"));
-                map.insert("key_code", rmpv::Value::from(vk_code));
-            }
-            super::InputEvent::KeyUp { vk_code } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("key_up"));
-                map.insert("key_code", rmpv::Value::from(vk_code));
-            }
-            super::InputEvent::MouseDown { x, y, button } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("mouse_down"));
-                map.insert("x", rmpv::Value::from(x));
-                map.insert("y", rmpv::Value::from(y));
-                map.insert("button", rmpv::Value::from(button));
-            }
-            super::InputEvent::MouseUp { x, y, button } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("mouse_up"));
-                map.insert("x", rmpv::Value::from(x));
-                map.insert("y", rmpv::Value::from(y));
-                map.insert("button", rmpv::Value::from(button));
-            }
-            super::InputEvent::MouseMove { x, y } => {
-                map.insert("track", rmpv::Value::from(2u8));
-                map.insert("type", rmpv::Value::from("mouse_move"));
-                map.insert("x", rmpv::Value::from(x));
-                map.insert("y", rmpv::Value::from(y));
-            }
-        }
-        if let Ok(data) = rmp_serde::to_vec(&map) {
-            let _ = shadow_core::write_event(data);
         }
     }
 }
@@ -510,8 +446,8 @@ impl InputMonitor for LinuxInputMonitor {
     async fn start(&mut self) -> Result<()> {
         use evdev::{Key, RelativeAxisType};
 
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
         // One blocking reader thread per keyboard/mouse device. evdev reports raw
         // codes globally; mouse motion is relative, so absolute coordinates are read
@@ -534,18 +470,7 @@ impl InputMonitor for LinuxInputMonitor {
             }
         });
 
-        // Ingest events into shadow-core, mirroring the Windows/macOS consumers.
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = event_rx.recv() => match event {
-                        Some(ev) => linux_ingest(ev),
-                        None => break,
-                    },
-                    _ = &mut stop_rx => break,
-                }
-            }
-        });
+        spawn_ingest_task(event_rx, stop_rx);
 
         self.stop_tx = Some(stop_tx);
         tracing::info!("Linux input monitor started (evdev)");
@@ -601,12 +526,8 @@ fn linux_read_device(mut dev: evdev::Device, tx: tokio::sync::mpsc::UnboundedSen
                         }
                     }
                     _ => match ev.value() {
-                        1 => Some(InputEvent::KeyDown {
-                            vk_code: key.0 as u32,
-                        }),
-                        0 => Some(InputEvent::KeyUp {
-                            vk_code: key.0 as u32,
-                        }),
+                        1 => Some(InputEvent::KeyDown),
+                        0 => Some(InputEvent::KeyUp),
                         _ => None, // 2 = autorepeat
                     },
                 },
@@ -634,58 +555,80 @@ fn linux_read_device(mut dev: evdev::Device, tx: tokio::sync::mpsc::UnboundedSen
     }
 }
 
-#[cfg(target_os = "linux")]
-fn linux_ingest(event: InputEvent) {
-    if crate::server::is_capture_paused() {
-        return;
-    }
-    use std::collections::HashMap;
-
-    let mut map: HashMap<&str, rmpv::Value> = HashMap::new();
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64;
-    map.insert("ts", rmpv::Value::from(now_us));
-    map.insert("v", rmpv::Value::from(2u8));
-    map.insert("track", rmpv::Value::from(2u8));
-
-    match event {
-        InputEvent::KeyDown { vk_code } => {
-            map.insert("type", rmpv::Value::from("key_down"));
-            map.insert("key_code", rmpv::Value::from(vk_code));
-        }
-        InputEvent::KeyUp { vk_code } => {
-            map.insert("type", rmpv::Value::from("key_up"));
-            map.insert("key_code", rmpv::Value::from(vk_code));
-        }
-        InputEvent::MouseDown { x, y, button } => {
-            map.insert("type", rmpv::Value::from("mouse_down"));
-            map.insert("x", rmpv::Value::from(x));
-            map.insert("y", rmpv::Value::from(y));
-            map.insert("button", rmpv::Value::from(button));
-        }
-        InputEvent::MouseUp { x, y, button } => {
-            map.insert("type", rmpv::Value::from("mouse_up"));
-            map.insert("x", rmpv::Value::from(x));
-            map.insert("y", rmpv::Value::from(y));
-            map.insert("button", rmpv::Value::from(button));
-        }
-        InputEvent::MouseMove { x, y } => {
-            map.insert("type", rmpv::Value::from("mouse_move"));
-            map.insert("x", rmpv::Value::from(x));
-            map.insert("y", rmpv::Value::from(y));
-        }
-    }
-
-    if let Ok(data) = rmp_serde::to_vec(&map) {
-        let _ = shadow_core::write_event(data);
-    }
-}
-
 #[cfg(target_os = "windows")]
 pub type PlatformInputMonitor = WindowsInputMonitor;
 #[cfg(target_os = "macos")]
 pub type PlatformInputMonitor = MacOSInputMonitor;
 #[cfg(target_os = "linux")]
 pub type PlatformInputMonitor = LinuxInputMonitor;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeSet, HashMap};
+
+    /// Round-trip through MessagePack exactly as the platform ingest paths do,
+    /// so the assertions cover the bytes that reach the event log.
+    fn persisted(event: InputEvent) -> HashMap<String, rmpv::Value> {
+        let bytes = rmp_serde::to_vec(&input_event_record(&event, 1_700_000_000_000_000)).unwrap();
+        rmp_serde::from_slice(&bytes).unwrap()
+    }
+
+    fn keys(record: &HashMap<String, rmpv::Value>) -> BTreeSet<&str> {
+        record.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn key_events_never_persist_the_key_code() {
+        for (event, kind) in [
+            (InputEvent::KeyDown, "key_down"),
+            (InputEvent::KeyUp, "key_up"),
+        ] {
+            let record = persisted(event);
+            assert!(
+                !record.contains_key("key_code"),
+                "{kind} record must not store a key code: {record:?}"
+            );
+            assert_eq!(keys(&record), BTreeSet::from(["track", "ts", "type", "v"]));
+            assert_eq!(record["type"].as_str(), Some(kind));
+            assert_eq!(record["track"].as_u64(), Some(2));
+            assert_eq!(record["v"].as_u64(), Some(2));
+            assert_eq!(record["ts"].as_u64(), Some(1_700_000_000_000_000));
+        }
+    }
+
+    #[test]
+    fn mouse_events_keep_their_coordinates_and_button() {
+        let down = persisted(InputEvent::MouseDown {
+            x: 10,
+            y: -20,
+            button: 1,
+        });
+        assert_eq!(
+            keys(&down),
+            BTreeSet::from(["button", "track", "ts", "type", "v", "x", "y"])
+        );
+        assert_eq!(down["type"].as_str(), Some("mouse_down"));
+        assert_eq!(down["x"].as_i64(), Some(10));
+        assert_eq!(down["y"].as_i64(), Some(-20));
+        assert_eq!(down["button"].as_u64(), Some(1));
+
+        let up = persisted(InputEvent::MouseUp {
+            x: 3,
+            y: 4,
+            button: 2,
+        });
+        assert_eq!(up["type"].as_str(), Some("mouse_up"));
+        assert_eq!(up["button"].as_u64(), Some(2));
+
+        let moved = persisted(InputEvent::MouseMove { x: 300, y: 400 });
+        assert_eq!(
+            keys(&moved),
+            BTreeSet::from(["track", "ts", "type", "v", "x", "y"])
+        );
+        assert_eq!(moved["type"].as_str(), Some("mouse_move"));
+        assert_eq!(moved["track"].as_u64(), Some(2));
+        assert_eq!(moved["x"].as_i64(), Some(300));
+        assert_eq!(moved["y"].as_i64(), Some(400));
+    }
+}

@@ -5,9 +5,9 @@ pub mod search;
 pub use ax::{
     AXClickTool, AXElementAtTool, AXFocusAppTool, AXHotkeyTool, AXInspectTool, AXListAppsTool,
     AXReadTextTool, AXScrollTool, AXTreeQueryTool, AXTypeTool, AXWaitTool,
-    CaptureLiveScreenshotTool, ReplayProcedureTool,
+    CaptureLiveScreenshotTool,
 };
-pub use memory::{GetDirectivesTool, GetKnowledgeTool, SetDirectiveTool};
+pub use memory::{GetDirectivesTool, GetKnowledgeTool};
 pub use search::{
     GetActivitySequenceTool, GetDaySummaryTool, GetTimelineContextTool, GetTranscriptWindowTool,
     InspectScreenshotsTool, ResolveLatestMeetingTool, SearchHybridTool, SearchSummariesTool,

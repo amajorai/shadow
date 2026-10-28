@@ -246,6 +246,62 @@ fn extract_json_object(s: &str) -> Option<String> {
     }
 }
 
+/// Content store of `indices/summaries.db`.
+const STORE: &str = "shadow-summaries";
+/// The sealed text columns of `meeting_summaries` (everything a meeting said).
+const SEALED: [&str; 8] = [
+    "title",
+    "summary",
+    "key_points",
+    "decisions",
+    "action_items",
+    "open_questions",
+    "highlights",
+    "participants",
+];
+
+fn seal_field(id: &str, column: &str, value: &str) -> rusqlite::Result<String> {
+    crate::sealed_db::seal(STORE, "meeting_summaries", column, id, value)
+}
+
+fn seal_list<T: Serialize>(id: &str, column: &str, value: &T) -> rusqlite::Result<String> {
+    seal_field(
+        id,
+        column,
+        &serde_json::to_string(value).unwrap_or_default(),
+    )
+}
+
+/// Build a summary from a row of the shared SELECT; `None` (counted) when a
+/// sealed field does not open.
+fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<MeetingSummary>> {
+    let id: String = row.get(0)?;
+    let mut opened = Vec::with_capacity(SEALED.len());
+    for (index, column) in SEALED.iter().enumerate() {
+        let stored: String = row.get(index + 1)?;
+        match crate::sealed_db::open_value(STORE, "meeting_summaries", column, &id, stored) {
+            Some(value) => opened.push(value),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(MeetingSummary {
+        title: opened[0].clone(),
+        summary: opened[1].clone(),
+        key_points: serde_json::from_str(&opened[2]).unwrap_or_default(),
+        decisions: serde_json::from_str(&opened[3]).unwrap_or_default(),
+        action_items: serde_json::from_str(&opened[4]).unwrap_or_default(),
+        open_questions: serde_json::from_str(&opened[5]).unwrap_or_default(),
+        highlights: serde_json::from_str(&opened[6]).unwrap_or_default(),
+        participants: serde_json::from_str(&opened[7]).unwrap_or_default(),
+        start_us: row.get::<_, i64>(9)? as u64,
+        end_us: row.get::<_, i64>(10)? as u64,
+        app_name: row.get(11)?,
+        created_at: row.get::<_, i64>(12)? as u64,
+        transcript_hash: row.get(13)?,
+        id,
+    }))
+}
+
 /// SQLite-backed store for meeting summaries.
 pub struct SummaryStore {
     conn: rusqlite::Connection,
@@ -253,8 +309,13 @@ pub struct SummaryStore {
 
 impl SummaryStore {
     pub fn new(db_path: &std::path::Path) -> Result<Self> {
-        let conn = rusqlite::Connection::open(db_path)?;
-        conn.execute_batch(
+        let columns: Vec<(&str, &str)> = SEALED
+            .iter()
+            .map(|column| ("meeting_summaries", *column))
+            .collect();
+        let conn = crate::sealed_db::open(
+            db_path,
+            STORE,
             "CREATE TABLE IF NOT EXISTS meeting_summaries (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -271,6 +332,7 @@ impl SummaryStore {
                 created_at INTEGER NOT NULL,
                 transcript_hash TEXT NOT NULL UNIQUE
             );",
+            &columns,
         )?;
         Ok(Self { conn })
     }
@@ -283,14 +345,14 @@ impl SummaryStore {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![
                 summary.id,
-                summary.title,
-                summary.summary,
-                serde_json::to_string(&summary.key_points).unwrap_or_default(),
-                serde_json::to_string(&summary.decisions).unwrap_or_default(),
-                serde_json::to_string(&summary.action_items).unwrap_or_default(),
-                serde_json::to_string(&summary.open_questions).unwrap_or_default(),
-                serde_json::to_string(&summary.highlights).unwrap_or_default(),
-                serde_json::to_string(&summary.participants).unwrap_or_default(),
+                seal_field(&summary.id, "title", &summary.title)?,
+                seal_field(&summary.id, "summary", &summary.summary)?,
+                seal_list(&summary.id, "key_points", &summary.key_points)?,
+                seal_list(&summary.id, "decisions", &summary.decisions)?,
+                seal_list(&summary.id, "action_items", &summary.action_items)?,
+                seal_list(&summary.id, "open_questions", &summary.open_questions)?,
+                seal_list(&summary.id, "highlights", &summary.highlights)?,
+                seal_list(&summary.id, "participants", &summary.participants)?,
                 summary.start_us as i64,
                 summary.end_us as i64,
                 summary.app_name,
@@ -308,26 +370,9 @@ impl SummaryStore {
              FROM meeting_summaries ORDER BY created_at DESC LIMIT ?1",
         )?;
 
-        let rows = stmt.query_map([limit as i64], |row| {
-            Ok(MeetingSummary {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                summary: row.get(2)?,
-                key_points: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                decisions: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                action_items: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                open_questions: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                highlights: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
-                participants: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
-                start_us: row.get::<_, i64>(9)? as u64,
-                end_us: row.get::<_, i64>(10)? as u64,
-                app_name: row.get(11)?,
-                created_at: row.get::<_, i64>(12)? as u64,
-                transcript_hash: row.get(13)?,
-            })
-        })?;
+        let rows = stmt.query_map([limit as i64], |row| summary_from_row(row))?;
 
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|r| r.ok().flatten()).collect())
     }
 
     pub fn get(&self, id: &str) -> Result<Option<MeetingSummary>> {
@@ -337,26 +382,16 @@ impl SummaryStore {
              FROM meeting_summaries WHERE id = ?1",
         )?;
 
-        let mut rows = stmt.query_map([id], |row| {
-            Ok(MeetingSummary {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                summary: row.get(2)?,
-                key_points: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
-                decisions: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                action_items: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                open_questions: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-                highlights: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
-                participants: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
-                start_us: row.get::<_, i64>(9)? as u64,
-                end_us: row.get::<_, i64>(10)? as u64,
-                app_name: row.get(11)?,
-                created_at: row.get::<_, i64>(12)? as u64,
-                transcript_hash: row.get(13)?,
-            })
-        })?;
+        let mut rows = stmt.query_map([id], |row| summary_from_row(row))?;
 
-        Ok(rows.next().and_then(|r| r.ok()))
+        // Get by id: a sealed field that does not open is an error, not "absent".
+        match rows.next() {
+            None => Ok(None),
+            Some(row) => match row? {
+                Some(summary) => Ok(Some(summary)),
+                None => anyhow::bail!("meeting summary {id} does not open"),
+            },
+        }
     }
 }
 
@@ -366,7 +401,30 @@ mod tests {
     use serde_json::json;
 
     fn temp_db() -> std::path::PathBuf {
+        crate::sealed_db::test_support::key();
         std::env::temp_dir().join(format!("shadow-summary-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn summaries_are_sealed_on_disk() {
+        let path = temp_db();
+        let store = SummaryStore::new(&path).unwrap();
+        let mut summary = sample_summary("m1", "h1");
+        summary.summary = "ConfidentialMergerTalk".into();
+        summary.participants = vec!["carol-uniquename".into()];
+        store.store(&summary).unwrap();
+        assert!(!crate::sealed_db::test_support::db_contains(
+            &path,
+            "ConfidentialMergerTalk"
+        ));
+        assert!(!crate::sealed_db::test_support::db_contains(
+            &path,
+            "carol-uniquename"
+        ));
+        let back = store.get("m1").unwrap().unwrap();
+        assert_eq!(back.summary, "ConfidentialMergerTalk");
+        assert_eq!(back.participants, vec!["carol-uniquename".to_string()]);
+        let _ = std::fs::remove_file(&path);
     }
 
     fn sample_summary(id: &str, hash: &str) -> MeetingSummary {

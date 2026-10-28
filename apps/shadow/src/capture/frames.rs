@@ -21,21 +21,21 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-// ─── Swappable defaults (nothing hardcoded — every knob is an env override) ──────
+// ─── Extraction tunables ─────────────────────────────────────────────────────────
 
 /// Scene-change score above which ffmpeg emits a keyframe (`gt(scene,THRESH)`).
-const DEFAULT_SCENE_THRESHOLD: f64 = 0.3;
+const SCENE_THRESHOLD: f64 = 0.3;
 /// Output frame width; frames are downscaled to this via `scale=W:-1`. Distinct
 /// from the capture-time `MAX_FRAME_WIDTH` (1280) — clip keyframes are for an
 /// agent to read, so 512px keeps the token cost down.
-const DEFAULT_FRAME_WIDTH: u32 = 512;
+const FRAME_WIDTH: u32 = 512;
 /// Grayscale-thumbnail mean-abs-delta (0–255) at or below which a frame is
 /// dropped as a near-duplicate of the previous KEPT frame.
-const DEFAULT_DEDUP_DELTA: f64 = 2.0;
+const DEDUP_DELTA: f64 = 2.0;
 /// Target frame count for the duration-aware `efficient` mode (fps = N / secs).
-const DEFAULT_EFFICIENT_FRAMES: u32 = 50;
+const EFFICIENT_FRAMES: u32 = 50;
 /// Max frames the `balanced` mode keeps; more are subsampled evenly.
-const DEFAULT_BALANCED_CAP: usize = 100;
+const BALANCED_CAP: usize = 100;
 
 /// A video longer than this counts as "long" for the subsample `scan_warning`.
 const LONG_VIDEO_MS: u64 = 5 * 60 * 1000;
@@ -73,36 +73,6 @@ pub struct KeyframeSet {
     pub scan_warning: Option<String>,
 }
 
-// ─── Env knobs ──────────────────────────────────────────────────────────────────
-
-fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(default)
-}
-
-fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
-}
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(default)
-}
-
-fn frame_width() -> u32 {
-    env_u32("RYU_CLIP_FRAME_WIDTH", DEFAULT_FRAME_WIDTH).max(16)
-}
-
 fn secs_str(ms: u64) -> String {
     format!("{:.3}", ms as f64 / 1000.0)
 }
@@ -124,7 +94,7 @@ pub fn extract_keyframes(
         return Ok(KeyframeSet::default());
     }
     std::fs::create_dir_all(out_dir)?;
-    let width = frame_width();
+    let width = FRAME_WIDTH;
 
     match mode {
         DetailMode::Transcript => Ok(KeyframeSet::default()),
@@ -166,10 +136,9 @@ fn extract_efficient(
 ) -> anyhow::Result<Vec<Keyframe>> {
     let eff_ms = effective_span_ms(start_ms, end_ms, duration_ms);
     let dur_secs = (eff_ms as f64 / 1000.0).max(0.001);
-    let target = env_u32("RYU_CLIP_EFFICIENT_FRAMES", DEFAULT_EFFICIENT_FRAMES).max(1);
     // fps = target frames / duration, clamped so a very short clip can't ask for a
     // firehose and a very long one still samples occasionally.
-    let fps = (target as f64 / dur_secs).clamp(0.05, 30.0);
+    let fps = (f64::from(EFFICIENT_FRAMES) / dur_secs).clamp(0.05, 30.0);
 
     let vf = format!("fps={fps:.4},scale={width}:-1");
     run_ffmpeg_extract(mp4, out_dir, &vf, start_ms, end_ms)?;
@@ -200,7 +169,6 @@ fn extract_scene(
     duration_ms: u64,
     width: u32,
 ) -> anyhow::Result<KeyframeSet> {
-    let threshold = env_f64("RYU_CLIP_SCENE_THRESHOLD", DEFAULT_SCENE_THRESHOLD);
     let meta_name = "scene-meta.txt";
 
     // `select` emits a frame whenever the scene score exceeds the threshold;
@@ -208,8 +176,9 @@ fn extract_scene(
     // metadata sink uses a *relative* filename so we can side-step ffmpeg
     // filter-graph path escaping (colons/backslashes on Windows) by running with
     // `current_dir = out_dir`.
-    let vf =
-        format!("select='gt(scene,{threshold})',metadata=print:file={meta_name},scale={width}:-1");
+    let vf = format!(
+        "select='gt(scene,{SCENE_THRESHOLD})',metadata=print:file={meta_name},scale={width}:-1"
+    );
     run_ffmpeg_extract(mp4, out_dir, &vf, start_ms, end_ms)?;
 
     let pts_times = parse_pts_times(&out_dir.join(meta_name));
@@ -225,13 +194,12 @@ fn extract_scene(
         .collect();
 
     // Grayscale-delta dedup against the previous KEPT frame.
-    let dedup_delta = env_f64("RYU_CLIP_DEDUP_DELTA", DEFAULT_DEDUP_DELTA);
     let mut kept: Vec<(u64, PathBuf)> = Vec::new();
     let mut prev_thumb: Option<Vec<u8>> = None;
     for (at_ms, path) in paired {
         let thumb = gray_thumb(&path);
         let is_dup = match (&prev_thumb, &thumb) {
-            (Some(prev), Some(cur)) => mean_abs_delta(prev, cur) <= dedup_delta,
+            (Some(prev), Some(cur)) => mean_abs_delta(prev, cur) <= DEDUP_DELTA,
             _ => false,
         };
         if is_dup {
@@ -247,11 +215,10 @@ fn extract_scene(
     // Cap `balanced`; `tokenBurner` is uncapped.
     let mut scan_warning = None;
     if matches!(mode, DetailMode::Balanced) {
-        let cap = env_usize("RYU_CLIP_BALANCED_CAP", DEFAULT_BALANCED_CAP);
-        if kept.len() > cap {
+        if kept.len() > BALANCED_CAP {
             let total = kept.len();
             // Delete the frames we're about to drop so only the kept subset stays.
-            let subset = subsample_even(kept, cap);
+            let subset = subsample_even(kept, BALANCED_CAP);
             kept = subset;
             if duration_ms >= LONG_VIDEO_MS {
                 scan_warning = Some(format!(

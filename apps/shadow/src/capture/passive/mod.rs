@@ -12,7 +12,7 @@
 //! - 6  clipboard
 //! - 7  filesystem
 //! - 8  git
-//! - 9  terminal (ingested via the shell hook → `/ingest`)
+//! - 9  terminal (the shell hook's user-only spool, drained by `terminal`)
 //! - 10 notifications
 //! - 11 calendar
 
@@ -21,6 +21,7 @@ pub mod clipboard;
 pub mod fs;
 pub mod git;
 pub mod notifications;
+pub mod settings;
 pub mod terminal;
 
 use std::collections::HashMap;
@@ -34,14 +35,16 @@ pub const TRACK_NOTIFICATION: u8 = 10;
 pub const TRACK_CALENDAR: u8 = 11;
 
 /// Start every passive capture source. Each is independently fault-isolated; this
-/// never returns an error so a missing capability cannot abort startup.
+/// never returns an error so a missing capability cannot abort startup. Source
+/// preferences come from [`settings::PassiveCaptureSettings`] in `data_dir`.
 pub fn start_all(data_dir: PathBuf) {
+    let settings = settings::PassiveCaptureSettings::load(&data_dir);
     clipboard::start();
-    fs::start();
-    git::start();
+    fs::start(settings.fs_watch);
+    git::start(settings.git_repos);
     terminal::start(&data_dir);
     notifications::start();
-    calendar::start();
+    calendar::start(settings.calendar_ics);
     tracing::info!(
         "✓ Passive capture sources started (clipboard/fs/git/terminal/notifications/calendar)"
     );
@@ -80,11 +83,24 @@ pub fn emit(
     text: &str,
     extra: Vec<(&'static str, rmpv::Value)>,
 ) {
+    emit_at(now_micros(), track, event_type, source, text, extra);
+}
+
+/// [`emit`] with an explicit event time (Unix microseconds), for sources that
+/// observe an event after it happened (the terminal spool).
+pub fn emit_at(
+    ts: u64,
+    track: u8,
+    event_type: &str,
+    source: &str,
+    text: &str,
+    extra: Vec<(&'static str, rmpv::Value)>,
+) {
     if crate::server::is_capture_paused() {
         return;
     }
     let mut map: HashMap<&str, rmpv::Value> = HashMap::new();
-    map.insert("ts", rmpv::Value::from(now_micros()));
+    map.insert("ts", rmpv::Value::from(ts));
     map.insert("v", rmpv::Value::from(2u8));
     map.insert("track", rmpv::Value::from(track));
     map.insert("type", rmpv::Value::from(event_type));

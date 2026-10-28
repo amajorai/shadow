@@ -30,13 +30,13 @@ cargo build --release --features video
 ./target/release/shadow         # binds :3030 by default
 ```
 
-Capture data is stored under `~/.ryu/shadow/`. The default build records JPEG keyframes with no system dependencies; the optional `video` feature adds full H.265 MP4.
+Capture data is stored under the Ryu data dir at `services/shadow/` (e.g. `~/.ryu/services/shadow/`); downloaded models live in `models/vision/shadow/`. The default build records JPEG keyframes with no system dependencies; the optional `video` feature adds full H.265 MP4.
 
 ## What it does
 
 - **Capture** — screen, microphone/system audio, input events, window focus, and accessibility data
 - **Keyframes** — pure-Rust JPEG keyframes written on change (no ffmpeg)
-- **Passive sources** — clipboard, filesystem, git, terminal, notifications, calendar
+- **Passive sources** — clipboard, filesystem, git, terminal, notifications, calendar. Extra watched folders, extra git repos and the calendar `.ics` file are set as `fsWatch`, `gitRepos` and `calendarIcs` in `passive-capture.json` in the Shadow data directory
 - **Intelligence** — OCR, embeddings, context grounding, meeting detection, proactive suggestions
 - **Memory** — semantic memory with consolidation and query planning, searchable end-to-end
 - **Consent gates** — per-app allowlist and a global pause; nothing is captured unless allowed

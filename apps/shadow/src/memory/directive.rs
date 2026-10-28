@@ -17,16 +17,20 @@ pub struct Directive {
     pub created_at: u64,
 }
 
-/// SQLite-backed directive store.
+/// Content store of `indices/memory.db` (shared with the semantic memory).
+const STORE: &str = "shadow-memory";
+
+/// SQLite-backed directive store. `content`, `trigger_pattern` and `action` are
+/// sealed; trigger matching already runs here after loading.
 pub struct DirectiveMemoryStore {
     conn: Connection,
 }
 
 impl DirectiveMemoryStore {
     pub fn new(db_path: &std::path::Path) -> Result<Self> {
-        std::fs::create_dir_all(db_path.parent().unwrap_or(std::path::Path::new(".")))?;
-        let conn = Connection::open(db_path)?;
-        conn.execute_batch(
+        let conn = crate::sealed_db::open(
+            db_path,
+            STORE,
             "CREATE TABLE IF NOT EXISTS directives (
                 id TEXT PRIMARY KEY,
                 directive_type TEXT NOT NULL,
@@ -40,6 +44,11 @@ impl DirectiveMemoryStore {
             );
             CREATE INDEX IF NOT EXISTS idx_directives_type ON directives(directive_type);
             CREATE INDEX IF NOT EXISTS idx_directives_active ON directives(completed_at) WHERE completed_at IS NULL;",
+            &[
+                ("directives", "content"),
+                ("directives", "trigger_pattern"),
+                ("directives", "action"),
+            ],
         )?;
         Ok(Self { conn })
     }
@@ -56,7 +65,7 @@ impl DirectiveMemoryStore {
         )?;
         let mut directives: Vec<Directive> = stmt
             .query_map(rusqlite::params![now], row_to_directive)?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok().flatten())
             .collect();
         if let Some(t) = type_filter {
             directives.retain(|d| d.directive_type == t);
@@ -71,9 +80,21 @@ impl DirectiveMemoryStore {
             rusqlite::params![
                 directive.id,
                 directive.directive_type,
-                directive.content,
-                directive.trigger_pattern,
-                directive.action,
+                crate::sealed_db::seal(STORE, "directives", "content", &directive.id, &directive.content)?,
+                crate::sealed_db::seal_optional(
+                    STORE,
+                    "directives",
+                    "trigger_pattern",
+                    &directive.id,
+                    directive.trigger_pattern.as_deref()
+                )?,
+                crate::sealed_db::seal_optional(
+                    STORE,
+                    "directives",
+                    "action",
+                    &directive.id,
+                    directive.action.as_deref()
+                )?,
                 directive.priority as i64,
                 directive.expires_at.map(|t| t as i64),
                 directive.created_at as i64,
@@ -105,17 +126,38 @@ impl DirectiveMemoryStore {
     }
 }
 
-fn row_to_directive(row: &rusqlite::Row<'_>) -> rusqlite::Result<Directive> {
-    Ok(Directive {
-        id: row.get(0)?,
+/// A directive from a row; `None` (counted) when a sealed field does not open.
+fn row_to_directive(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Directive>> {
+    let id: String = row.get(0)?;
+    let Some(content) =
+        crate::sealed_db::open_value(STORE, "directives", "content", &id, row.get(2)?)
+    else {
+        return Ok(None);
+    };
+    let optional = |column: &str, index: usize| -> rusqlite::Result<Result<Option<String>, ()>> {
+        Ok(crate::sealed_db::open_optional(
+            STORE,
+            "directives",
+            column,
+            &id,
+            row.get(index)?,
+        ))
+    };
+    let (Ok(trigger_pattern), Ok(action)) =
+        (optional("trigger_pattern", 3)?, optional("action", 4)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Directive {
+        id: id.clone(),
         directive_type: row.get(1)?,
-        content: row.get(2)?,
-        trigger_pattern: row.get(3)?,
-        action: row.get(4)?,
+        content,
+        trigger_pattern,
+        action,
         priority: row.get::<_, i64>(5)? as u8,
         expires_at: row.get::<_, Option<i64>>(6)?.map(|t| t as u64),
         created_at: row.get::<_, i64>(7)? as u64,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -123,7 +165,31 @@ mod tests {
     use super::*;
 
     fn temp_db() -> std::path::PathBuf {
+        crate::sealed_db::test_support::key();
         std::env::temp_dir().join(format!("shadow-directive-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn directive_text_is_sealed_on_disk() {
+        let path = temp_db();
+        let store = DirectiveMemoryStore::new(&path).unwrap();
+        let mut d = directive("d1", "reminder", "Call lawyer-gecko", 5);
+        d.trigger_pattern = Some("divorce-axolotl".into());
+        store.create(&d).unwrap();
+        assert!(!crate::sealed_db::test_support::db_contains(
+            &path,
+            "lawyer-gecko"
+        ));
+        assert!(!crate::sealed_db::test_support::db_contains(
+            &path,
+            "divorce-axolotl"
+        ));
+        let hits = store
+            .check_triggers("about the DIVORCE-AXOLOTL case")
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content, "Call lawyer-gecko");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn directive(id: &str, dtype: &str, content: &str, priority: u8) -> Directive {

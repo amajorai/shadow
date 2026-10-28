@@ -3,8 +3,8 @@
 //! checkouts, pulls, merges). Portable: shells out to the `git` CLI, no new crate.
 //!
 //! Repos are discovered by a shallow scan of the same roots the filesystem watcher
-//! uses (plus `SHADOW_GIT_REPOS`), refreshed periodically so newly-cloned repos are
-//! picked up.
+//! uses (plus `gitRepos` in `passive-capture.json`), refreshed periodically so
+//! newly-cloned repos are picked up.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -70,16 +70,8 @@ fn find_repos(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn discover_repos() -> Vec<PathBuf> {
-    let mut repos = Vec::new();
-    if let Ok(explicit) = std::env::var("SHADOW_GIT_REPOS") {
-        for part in explicit.split([';', ',']) {
-            let part = part.trim();
-            if !part.is_empty() {
-                repos.push(PathBuf::from(part));
-            }
-        }
-    }
+fn discover_repos(explicit: &[PathBuf]) -> Vec<PathBuf> {
+    let mut repos = explicit.to_vec();
     for root in scan_roots() {
         find_repos(&root, SCAN_DEPTH, &mut repos);
     }
@@ -110,8 +102,9 @@ fn head_state(repo: &Path) -> Option<(String, String, String)> {
     Some((hash.to_string(), branch, subject.to_string()))
 }
 
-/// Start git monitoring on a dedicated thread.
-pub fn start() {
+/// Start git monitoring on a dedicated thread. `explicit_repos` are followed on
+/// top of the auto-discovered ones.
+pub fn start(explicit_repos: Vec<PathBuf>) {
     std::thread::Builder::new()
         .name("shadow-git".into())
         .spawn(move || {
@@ -122,7 +115,7 @@ pub fn start() {
             }
 
             let mut last_commit: HashMap<PathBuf, String> = HashMap::new();
-            let mut repos = discover_repos();
+            let mut repos = discover_repos(&explicit_repos);
             tracing::info!("Git capture started ({} repos)", repos.len());
             // Seed current state so we don't emit the existing HEAD on first poll.
             for repo in &repos {
@@ -136,7 +129,7 @@ pub fn start() {
                 std::thread::sleep(POLL_INTERVAL);
                 ticks += 1;
                 if ticks % RESCAN_EVERY == 0 {
-                    repos = discover_repos();
+                    repos = discover_repos(&explicit_repos);
                 }
                 if crate::server::is_capture_paused() {
                     continue;

@@ -13,7 +13,7 @@ pub struct AXTreeNode {
     pub children: Vec<AXTreeNode>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bounds {
     pub x: i32,
     pub y: i32,

@@ -1,5 +1,5 @@
 //! Filesystem capture — watches the user's meaningful directories (Documents,
-//! Desktop, Downloads, and any roots in `SHADOW_FS_WATCH`) and emits an event on
+//! Desktop, Downloads, and any `fsWatch` roots in `passive-capture.json`) and emits an event on
 //! file create/modify/remove. Cross-platform via `notify`.
 //!
 //! Home is intentionally NOT watched wholesale: it is dominated by caches and app
@@ -34,10 +34,9 @@ fn is_noise(path: &Path) -> bool {
     NOISE.iter().any(|n| s.contains(n))
 }
 
-/// Directories to watch: the standard user dirs plus `SHADOW_FS_WATCH` (a
-/// `;`/`,`-separated list of extra roots). Nothing hardcoded beyond sensible
-/// defaults the user can override.
-fn watch_roots() -> Vec<PathBuf> {
+/// Directories to watch: the standard user dirs plus the extra roots saved as
+/// `fsWatch` in `passive-capture.json`.
+fn watch_roots(extra: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(d) = dirs::document_dir() {
         roots.push(d);
@@ -48,14 +47,7 @@ fn watch_roots() -> Vec<PathBuf> {
     if let Some(d) = dirs::download_dir() {
         roots.push(d);
     }
-    if let Ok(extra) = std::env::var("SHADOW_FS_WATCH") {
-        for part in extra.split([';', ',']) {
-            let part = part.trim();
-            if !part.is_empty() {
-                roots.push(PathBuf::from(part));
-            }
-        }
-    }
+    roots.extend(extra);
     roots
 }
 
@@ -69,8 +61,8 @@ fn kind_label(kind: &EventKind) -> Option<&'static str> {
 }
 
 /// Start filesystem monitoring on a dedicated thread that owns the watcher for the
-/// process lifetime.
-pub fn start() {
+/// process lifetime. `extra_roots` are watched on top of the standard user dirs.
+pub fn start(extra_roots: Vec<PathBuf>) {
     std::thread::Builder::new()
         .name("shadow-fs".into())
         .spawn(move || {
@@ -85,7 +77,7 @@ pub fn start() {
                 }
             };
 
-            let roots = watch_roots();
+            let roots = watch_roots(extra_roots);
             let mut watching = 0usize;
             for root in &roots {
                 if root.exists() && watcher.watch(root, RecursiveMode::Recursive).is_ok() {
