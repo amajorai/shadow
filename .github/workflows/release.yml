@@ -102,14 +102,14 @@ jobs:
           workspaces: apps/shadow
           key: ${{ matrix.plat }}
       # Established by enumerating the -sys crates in the Linux dep graph
-      # (alsa-sys via cpal, openssl-sys, dbus, opus). Never guard with `|| true`:
+      # (alsa-sys via cpal, openssl-sys, dbus). Never guard with `|| true`:
       # a missing dep must fail loudly at build time.
       - name: Linux build deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev libopus-dev libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev libdbus-1-dev libasound2-dev
       - name: macOS build deps
         if: runner.os == 'macOS'
-        run: brew install dbus pkg-config opus
+        run: brew install dbus pkg-config
       - name: Build
         shell: bash
         run: |

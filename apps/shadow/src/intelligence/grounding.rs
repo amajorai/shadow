@@ -7,6 +7,10 @@ pub struct GroundingResult {
     pub y: f32,
     pub confidence: f32,
     pub strategy: GroundingStrategy,
+    /// Set for accessibility hits: the element to act on semantically. Not
+    /// serialized (it is a live-resolution handle, not a result field).
+    #[serde(skip)]
+    pub ax_target: Option<AxTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +113,7 @@ mod showui {
                 y: flat[1].clamp(0.0, 1.0),
                 confidence: 0.75,
                 strategy: GroundingStrategy::LocalVlm,
+                ax_target: None,
             })
         }
     }
@@ -141,90 +146,168 @@ mod showui {
 
 // ─── AX-based grounding helpers ───────────────────────────────────────────────
 
-/// Try to find an element in the accessibility tree that matches `query` exactly.
-/// Returns normalised (x, y) center coordinates if found.
-async fn try_ax_exact(query: &str, screen_w: u32, screen_h: u32) -> Option<GroundingResult> {
-    use crate::capture::accessibility::{AXTree, PlatformAXTree};
-    let ax = PlatformAXTree::new().ok()?;
-    let element = ax.find_element(query).await?;
-    let bounds = element.bounds?;
-    let cx = bounds.x + bounds.width as i32 / 2;
-    let cy = bounds.y + bounds.height as i32 / 2;
+/// A grounding hit on a live accessibility element: a locator the caller can hand
+/// to a semantic action, plus the element's screen centre for an input fallback.
+#[derive(Debug, Clone)]
+pub struct AxTarget {
+    pub locator: ghost_eyes::ElementLocator,
+    pub center: (i32, i32),
+}
+
+/// One snapshot of the focused window for grounding (no renderer activation).
+async fn grounding_snapshot() -> Option<ghost_eyes::AXSnapshot> {
+    use ghost_eyes::accessibility::AXTree as _;
+    let ax = crate::capture::accessibility::PlatformAXTree::new().ok()?;
+    let opts = ghost_eyes::SnapshotOptions {
+        target: ghost_eyes::WindowTarget::Focused,
+        limits: ghost_eyes::WalkLimits::platform_default(),
+        activate_renderer: false,
+    };
+    ax.eyes().snapshot(opts).await.ok()
+}
+
+/// Locator for `node` at `path` (relative to the snapshot root). A known pid pins
+/// the process and window title, so the action refuses a window that changed.
+fn locator_for(
+    snapshot: &ghost_eyes::AXSnapshot,
+    path: Vec<u32>,
+    node: &ghost_eyes::AXTreeNode,
+) -> ghost_eyes::ElementLocator {
+    use ghost_eyes::WindowTarget;
+    let window = match (snapshot.pid, snapshot.window_title.as_deref()) {
+        (pid, Some(title)) if pid > 0 && !title.is_empty() => WindowTarget::PidTitle {
+            pid,
+            title: title.to_string(),
+        },
+        (pid, _) if pid > 0 => WindowTarget::Pid { pid },
+        _ => WindowTarget::Focused,
+    };
+    ghost_eyes::ElementLocator {
+        pid: snapshot.pid,
+        window,
+        path,
+        identity: ghost_eyes::ElementIdentity::from_node(node),
+    }
+}
+
+fn center_of(bounds: &crate::capture::Bounds) -> (i32, i32) {
+    (
+        bounds.x + (bounds.width / 2) as i32,
+        bounds.y + (bounds.height / 2) as i32,
+    )
+}
+
+fn ax_result(
+    snapshot: &ghost_eyes::AXSnapshot,
+    path: Vec<u32>,
+    node: &ghost_eyes::AXTreeNode,
+    screen: (u32, u32),
+    confidence: f32,
+    strategy: GroundingStrategy,
+) -> Option<GroundingResult> {
+    let center = center_of(node.bounds.as_ref()?);
+    let (screen_w, screen_h) = (screen.0.max(1) as f32, screen.1.max(1) as f32);
     Some(GroundingResult {
-        x: (cx as f32 / screen_w as f32).clamp(0.0, 1.0),
-        y: (cy as f32 / screen_h as f32).clamp(0.0, 1.0),
-        confidence: 0.95,
-        strategy: GroundingStrategy::AxExact,
+        x: (center.0 as f32 / screen_w).clamp(0.0, 1.0),
+        y: (center.1 as f32 / screen_h).clamp(0.0, 1.0),
+        confidence,
+        strategy,
+        ax_target: Some(AxTarget {
+            locator: locator_for(snapshot, path, node),
+            center,
+        }),
     })
 }
 
-/// Fuzzy AX match: walk the full tree and pick the element whose title/role
-/// has the highest token overlap with the query.
-async fn try_ax_fuzzy(query: &str, screen_w: u32, screen_h: u32) -> Option<GroundingResult> {
-    use crate::capture::accessibility::{AXTree, AXTreeNode, PlatformAXTree};
+/// Try to find an element in the accessibility tree that matches `query` exactly
+/// (case-insensitive substring of role, title, identifier or non-secure value).
+fn try_ax_exact(
+    snapshot: &ghost_eyes::AXSnapshot,
+    query: &str,
+    screen: (u32, u32),
+) -> Option<GroundingResult> {
+    use ghost_eyes::accessibility::find::find_all;
+    let opts = crate::capture::accessibility::FIND_OPTIONS;
+    let (path, node) = find_all(&snapshot.root, query, opts, 1)
+        .into_iter()
+        .next()?;
+    ax_result(
+        snapshot,
+        path,
+        node,
+        screen,
+        0.95,
+        GroundingStrategy::AxExact,
+    )
+}
 
-    let ax = PlatformAXTree::new().ok()?;
-    let tree = ax.get_focused_tree().await.ok()?;
+/// Fuzzy AX match: walk the full tree and pick the element whose role/title/value
+/// has the highest token overlap with the query. Secure values are never read
+/// (they are withheld at the source).
+fn try_ax_fuzzy(
+    snapshot: &ghost_eyes::AXSnapshot,
+    query: &str,
+    screen: (u32, u32),
+) -> Option<GroundingResult> {
+    use ghost_eyes::AXTreeNode;
 
-    let query_lower = query.to_lowercase();
-    let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
+    struct Best<'a> {
+        score: f32,
+        path: Vec<u32>,
+        node: Option<&'a AXTreeNode>,
+    }
 
-    let mut best_score = 0.0f32;
-    let mut best: Option<GroundingResult> = None;
-
-    fn walk(
-        node: &AXTreeNode,
-        query_tokens: &[&str],
-        screen_w: u32,
-        screen_h: u32,
-        best_score: &mut f32,
-        best: &mut Option<GroundingResult>,
-    ) {
+    fn walk<'a>(node: &'a AXTreeNode, tokens: &[&str], path: &mut Vec<u32>, best: &mut Best<'a>) {
+        let value = if node.secure {
+            ""
+        } else {
+            node.value.as_deref().unwrap_or("")
+        };
         let text = format!(
             "{} {} {}",
             node.role,
             node.title.as_deref().unwrap_or(""),
-            node.value.as_deref().unwrap_or("")
+            value
         )
         .to_lowercase();
-
-        let matched = query_tokens.iter().filter(|&&t| text.contains(t)).count();
-        let score = matched as f32 / query_tokens.len().max(1) as f32;
-
-        if score > *best_score {
-            if let Some(ref b) = node.bounds {
-                let cx = b.x + b.width as i32 / 2;
-                let cy = b.y + b.height as i32 / 2;
-                *best_score = score;
-                *best = Some(GroundingResult {
-                    x: (cx as f32 / screen_w as f32).clamp(0.0, 1.0),
-                    y: (cy as f32 / screen_h as f32).clamp(0.0, 1.0),
-                    confidence: 0.5 + score * 0.4,
-                    strategy: GroundingStrategy::AxFuzzy,
-                });
-            }
+        let matched = tokens.iter().filter(|&&t| text.contains(t)).count();
+        let score = matched as f32 / tokens.len().max(1) as f32;
+        if score > best.score && node.bounds.is_some() {
+            best.score = score;
+            best.path = path.clone();
+            best.node = Some(node);
         }
-
-        for child in &node.children {
-            walk(child, query_tokens, screen_w, screen_h, best_score, best);
+        for (i, child) in node.children.iter().enumerate() {
+            path.push(u32::try_from(i).unwrap_or(u32::MAX));
+            walk(child, tokens, path, best);
+            path.pop();
         }
     }
 
-    walk(
-        &tree,
-        &query_tokens,
-        screen_w,
-        screen_h,
-        &mut best_score,
-        &mut best,
-    );
+    let query_lower = query.to_lowercase();
+    let tokens: Vec<&str> = query_lower.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut best = Best {
+        score: 0.0,
+        path: Vec::new(),
+        node: None,
+    };
+    walk(&snapshot.root, &tokens, &mut Vec::new(), &mut best);
 
     // Only accept if at least half the query tokens matched
-    if best_score >= 0.5 {
-        best
-    } else {
-        None
+    if best.score < 0.5 {
+        return None;
     }
+    ax_result(
+        snapshot,
+        best.path,
+        best.node?,
+        screen,
+        0.5 + best.score * 0.4,
+        GroundingStrategy::AxFuzzy,
+    )
 }
 
 // ─── Grounding oracle ─────────────────────────────────────────────────────────
@@ -265,20 +348,22 @@ impl GroundingOracle {
         width: u32,
         height: u32,
     ) -> Result<GroundingResult> {
-        // 1. AX exact match — near-zero latency, highest confidence
-        if let Some(r) = try_ax_exact(instruction, width, height).await {
-            tracing::debug!("Grounding: AX exact hit for {:?}", instruction);
-            return Ok(r);
-        }
+        if let Some(snapshot) = grounding_snapshot().await {
+            // 1. AX exact match — near-zero latency, highest confidence
+            if let Some(r) = try_ax_exact(&snapshot, instruction, (width, height)) {
+                tracing::debug!("Grounding: AX exact hit for {:?}", instruction);
+                return Ok(r);
+            }
 
-        // 2. AX fuzzy match — still free, covers partial descriptions
-        if let Some(r) = try_ax_fuzzy(instruction, width, height).await {
-            tracing::debug!(
-                "Grounding: AX fuzzy hit for {:?} (conf={:.2})",
-                instruction,
-                r.confidence
-            );
-            return Ok(r);
+            // 2. AX fuzzy match — still free, covers partial descriptions
+            if let Some(r) = try_ax_fuzzy(&snapshot, instruction, (width, height)) {
+                tracing::debug!(
+                    "Grounding: AX fuzzy hit for {:?} (conf={:.2})",
+                    instruction,
+                    r.confidence
+                );
+                return Ok(r);
+            }
         }
 
         // 3. ShowUI-2B local VLM (~300 ms)
@@ -332,35 +417,5 @@ pub fn parse_coordinates(output: &str) -> Option<(f32, f32)> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_bracket_format() {
-        assert_eq!(parse_coordinates("point [0.5, 0.25]"), Some((0.5, 0.25)));
-    }
-
-    #[test]
-    fn parses_paren_format() {
-        assert_eq!(parse_coordinates("(12, 34)"), Some((12.0, 34.0)));
-    }
-
-    #[test]
-    fn parses_click_function_format() {
-        assert_eq!(
-            parse_coordinates("call click(x=100, y=200) now"),
-            Some((100.0, 200.0))
-        );
-    }
-
-    #[test]
-    fn returns_none_when_no_coordinate_present() {
-        assert_eq!(parse_coordinates("no coordinates here"), None);
-    }
-
-    #[test]
-    fn bracket_takes_precedence_over_paren() {
-        // Both present: the bracket pattern is tried first.
-        assert_eq!(parse_coordinates("[1, 2] and (3, 4)"), Some((1.0, 2.0)));
-    }
-}
+#[path = "grounding_test.rs"]
+mod tests;

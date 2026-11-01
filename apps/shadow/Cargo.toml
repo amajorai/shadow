@@ -1,6 +1,6 @@
 [package]
 name = "shadow"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -54,7 +54,7 @@ whisper-rs = { version = "0.11", optional = true }  # Whisper transcription
 ffmpeg-next = { version = "7", optional = true }
 # Phase-2 content sealing (encb:v1 / RYU-CB01 / blind indexes). No OS keychain
 # backend: the key arrives from Core (RYU_SEAL_KEY) or RYU_MASTER_KEY.
-ryu-crypto = { path = "../../crates/core/crypto", version = "0.5.0", default-features = false, features = ["sqlite"] }
+ryu-crypto = { path = "../../crates/core/crypto", version = "0.5.1", default-features = false, features = ["sqlite"] }
 
 [features]
 default = []

@@ -11,6 +11,28 @@ use crate::agent::tools::ax::{
 use crate::agent::tools::{AgentTool, ToolResult};
 use crate::intelligence::safety::SafetyGate;
 
+/// A step whose tool reported a failure, with whether the contract error says a
+/// retry is safe (`disposition.retry == "safe"`: the input was not delivered).
+#[derive(Debug)]
+pub(crate) struct StepFailed {
+    message: String,
+    retry_safe: bool,
+}
+
+impl std::fmt::Display for StepFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StepFailed {}
+
+/// Whether a failed tool result's contract error allows a retry. A result without
+/// a disposition is treated as unsafe: nothing proves the input was not delivered.
+pub(crate) fn retry_is_safe(result: &serde_json::Value) -> bool {
+    result["error"]["disposition"]["retry"].as_str() == Some("safe")
+}
+
 /// Executes task plan steps using the AX tool suite.
 pub struct LocalExecutor {
     tools: Vec<Arc<dyn AgentTool>>,
@@ -64,7 +86,11 @@ impl LocalExecutor {
         let result: ToolResult = tool.execute(step.tool_args.clone()).await?;
 
         if let Some(err) = result.error {
-            anyhow::bail!("Step {} failed: {}", step.step_number, err);
+            return Err(StepFailed {
+                message: format!("Step {} failed: {}", step.step_number, err),
+                retry_safe: retry_is_safe(&result.result),
+            }
+            .into());
         }
 
         Ok(result.result)
@@ -131,6 +157,12 @@ impl LocalExecutor {
             ];
             if !READ_ONLY_TOOLS.contains(&step.tool_name.as_str()) {
                 let pre_hash = self.capture_ax_hash().await.unwrap_or(0);
+                // SwitchBack restores the app that was active before a focus change.
+                let app_context = if step.tool_name == "ax_focus_app" {
+                    active_app_name().await
+                } else {
+                    None
+                };
                 if let Ok(mut undo) = self.undo.lock() {
                     let scroll_dy =
                         step.tool_args["direction"]
@@ -140,7 +172,7 @@ impl LocalExecutor {
                         step.step_number as usize,
                         &step.tool_name,
                         pre_hash,
-                        step.tool_args["app"].as_str().map(str::to_string),
+                        app_context,
                         None,
                         scroll_dy,
                     );
@@ -174,6 +206,9 @@ impl LocalExecutor {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
+                    let retry_safe = e
+                        .downcast_ref::<StepFailed>()
+                        .is_some_and(|failed| failed.retry_safe);
                     let _ = tx.send(MimicryProgress::StepFailed {
                         step: step.step_number,
                         error: err_str.clone(),
@@ -191,22 +226,19 @@ impl LocalExecutor {
                             tracing::warn!("Step {} skipped: {}", step.step_number, err_str);
                             continue;
                         }
+                        StepFailureAction::Retry if !retry_safe => {
+                            // The input may already have been delivered (a press sent, some
+                            // characters typed): replaying it could submit or type twice.
+                            return Err(anyhow::anyhow!(
+                                "Step {} failed and was not retried because its input may \
+                                 already have been delivered: {}",
+                                step.step_number,
+                                err_str
+                            ));
+                        }
                         StepFailureAction::Retry => {
-                            // Broadening retry: inject "strategy": "fuzzy" for ax_click
-                            let retry_step = if step.tool_name == "ax_click" {
-                                let mut args = step.tool_args.clone();
-                                if let Some(obj) = args.as_object_mut() {
-                                    obj.insert("strategy".to_string(), serde_json::json!("fuzzy"));
-                                }
-                                std::borrow::Cow::Owned(ProcedureStep {
-                                    tool_args: args,
-                                    ..step.clone()
-                                })
-                            } else {
-                                std::borrow::Cow::Borrowed(step)
-                            };
-
-                            match self.execute_step(&retry_step).await {
+                            // Retry once; the step goes through the safety gate again.
+                            match self.execute_step(step).await {
                                 Ok(result) => {
                                     completed += 1;
                                     let _ = tx.send(MimicryProgress::StepCompleted {
@@ -216,7 +248,7 @@ impl LocalExecutor {
                                 }
                                 Err(e2) => {
                                     return Err(anyhow::anyhow!(
-                                        "Step {} failed after broadening retry: {}",
+                                        "Step {} failed after retry: {}",
                                         step.step_number,
                                         e2
                                     ));
@@ -305,6 +337,7 @@ impl LocalExecutor {
     }
 
     /// Undo the last executed step by dispatching the stored reversal strategy.
+    /// Failures are logged, never discarded silently.
     pub async fn undo_last_step(&self) {
         let strategy = {
             if let Ok(mut undo) = self.undo.lock() {
@@ -313,43 +346,62 @@ impl LocalExecutor {
                 None
             }
         };
-        if let Some(s) = strategy {
-            use super::undo_manager::UndoStrategy;
-            match s {
-                UndoStrategy::UndoShortcut => {
-                    let tool = self
-                        .tools
-                        .iter()
-                        .find(|t| t.definition().name == "ax_hotkey");
-                    if let Some(t) = tool {
-                        let _ = t.execute(serde_json::json!({"keys": "ctrl+z"})).await;
-                    }
-                }
-                UndoStrategy::SwitchBack(app) => {
-                    let tool = self
-                        .tools
-                        .iter()
-                        .find(|t| t.definition().name == "ax_focus_app");
-                    if let Some(t) = tool {
-                        let _ = t.execute(serde_json::json!({"app": app})).await;
-                    }
-                }
-                UndoStrategy::ReverseScroll { dy, .. } => {
-                    let tool = self
-                        .tools
-                        .iter()
-                        .find(|t| t.definition().name == "ax_scroll");
-                    if let Some(t) = tool {
-                        let dir = if dy < 0 { "up" } else { "down" };
-                        let _ = t.execute(serde_json::json!({"direction": dir})).await;
-                    }
-                }
-                UndoStrategy::Manual(reason) => {
-                    tracing::warn!("Cannot auto-undo last step: {}", reason);
+        let Some(strategy) = strategy else {
+            return;
+        };
+        use super::undo_manager::UndoStrategy;
+        let (tool, args) = match strategy {
+            UndoStrategy::UndoShortcut => {
+                // The platform undo chord: Cmd+Z on macOS, Ctrl+Z elsewhere.
+                let keys = if cfg!(target_os = "macos") {
+                    "cmd+z"
+                } else {
+                    "ctrl+z"
+                };
+                ("ax_hotkey", serde_json::json!({ "keys": keys }))
+            }
+            UndoStrategy::SwitchBack(app) => {
+                ("ax_focus_app", serde_json::json!({ "app_name": app }))
+            }
+            UndoStrategy::ReverseScroll { dy, .. } => {
+                let dir = if dy < 0 { "up" } else { "down" };
+                // The scroll point is not recorded; reverse at the display centre.
+                let (w, h) = crate::capture::screen::get_primary_display_size();
+                let (x, y) = (w / 2, h / 2);
+                (
+                    "ax_scroll",
+                    serde_json::json!({ "direction": dir, "x": x, "y": y }),
+                )
+            }
+            UndoStrategy::Manual(reason) => {
+                tracing::warn!("Cannot auto-undo last step: {}", reason);
+                return;
+            }
+        };
+        let Some(t) = self.tools.iter().find(|t| t.definition().name == tool) else {
+            tracing::warn!("Undo failed: tool {} is not available", tool);
+            return;
+        };
+        match t.execute(args).await {
+            Ok(result) => {
+                if let Some(err) = result.error {
+                    tracing::warn!("Undo via {} failed: {}", tool, err);
                 }
             }
+            Err(e) => tracing::warn!("Undo via {} failed: {}", tool, e),
         }
     }
+}
+
+/// Name of the currently active application, if the window tracker can tell.
+async fn active_app_name() -> Option<String> {
+    use crate::capture::WindowTracker;
+    let tracker = crate::capture::window::PlatformWindowTracker::new().ok()?;
+    tracker
+        .get_active_app()
+        .await
+        .map(|app| app.name)
+        .filter(|name| !name.is_empty())
 }
 
 impl Default for LocalExecutor {
@@ -368,3 +420,7 @@ fn hash_value(v: &serde_json::Value) -> u64 {
         .hash(&mut hasher);
     hasher.finish()
 }
+
+#[cfg(test)]
+#[path = "executor_test.rs"]
+mod tests;
